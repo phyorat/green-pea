@@ -160,9 +160,10 @@
 
 #ifndef CACHE_FLAGS
 #define CACHE_FLAGS 
-#define CACHE_INTERNAL_ONLY 0x00000001
-#define CACHE_DATABASE_ONLY 0x00000010
-#define CACHE_BOTH          0x00000100 /* Digging a grave */
+#define CACHE_INTERNAL      0x00000001
+#define CACHE_DATABASE      0x00000002
+//#define CACHE_BOTH          0x00000004 /* Digging a grave */
+#define CACHE_BOTH          (CACHE_INTERNAL|CACHE_DATABASE)
 #endif /* CACHE_FLAGS */
 
 

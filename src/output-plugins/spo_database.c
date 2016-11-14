@@ -1261,6 +1261,7 @@ void ParseDatabaseArgs(DatabaseData *data) {
 			data->use_ssl = 1;
 		} else if (!strncasecmp(dbarg, KEYWORD_MYSQL_RECONNECT,
 				strlen(KEYWORD_MYSQL_RECONNECT))) {
+		    LogMessage("Set MYSQL reconnect OK\n");
 			data->dbRH[DB_MYSQL].mysql_reconnect = 1;
 		}
 #endif
@@ -1380,7 +1381,7 @@ u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
 		return 1;
 	}
 
-	if ( (iUpdateSig->flag & CACHE_BOTH) || (iUpdateSig->flag & CACHE_DATABASE_ONLY) ) {
+	if ( iUpdateSig->flag & CACHE_DATABASE ) {
 	    isupdate = 1;
 		if (SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
 		SQL_UPDATE_SPECIFIC_SIGNATURE, iUpdateSig->obj.class_id,
@@ -1437,15 +1438,16 @@ u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
 	    LogMessage("%s: Last query(insert) auto_increament id %d\n", __func__, db_sig_id);
 	}
 
-	if (iUpdateSig->flag & CACHE_INTERNAL_ONLY) {
-		iUpdateSig->flag ^= (CACHE_INTERNAL_ONLY | CACHE_BOTH);
+	if ( !(iUpdateSig->flag & CACHE_DATABASE) ) {
+		//iUpdateSig->flag ^= (CACHE_INTERNAL_ONLY | CACHE_BOTH);
+	    iUpdateSig->flag |= CACHE_DATABASE;
 		iUpdateSig->obj.db_id = db_sig_id;
-	} else if ((iUpdateSig->flag & CACHE_BOTH)
-			|| (iUpdateSig->flag & CACHE_DATABASE_ONLY)) {
-		if (db_sig_id != iUpdateSig->obj.db_id) {
-			/* XXX */
-			LogMessage(
-					"ERROR database: Returned signature_id [%u] is not equal to updated signature_id [%u] in [%s()] \n",
+	}
+	else {//if ((iUpdateSig->flag & CACHE_BOTH)
+			//|| (iUpdateSig->flag & CACHE_DATABASE_ONLY)) {
+		if ( db_sig_id != iUpdateSig->obj.db_id ) {
+			LogMessage("ERROR database: Returned signature_id [%u] "
+			        "is not equal to updated signature_id [%u] in [%s()] \n",
 					db_sig_id, iUpdateSig->obj.db_id, __FUNCTION__);
 			return 1;
 		}
@@ -2324,7 +2326,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	uint16_t i;
 	char sl_separator;
 	char sl_buf[256];
-	char sl_buf_data[8192];
+	char *sl_buf_data;
 
 	if ( NULL == data ) {
 		LogMessage(
@@ -2344,10 +2346,11 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	DEBUG_U_WRAP(LogMessage("%s: proceed, detail %d\n", __func__, data->detail));
 
 	memset(sl_buf, 0, sizeof(sl_buf));
-	memset(sl_buf_data, 0, sizeof(sl_buf_data));
 
     /*** Build query for the additional packet ***/
 	if ( 0 < e_queue->ele_exp_cnt ) {
+	    sl_buf_data = e_queue->ele_pktbuf;
+
 	    if ((SQLQuery = SQL_GetNextQueryAdData(data, q_ins)) == NULL) {
 	        LogMessage("%s: bad_query hmmm\n", __func__);
 	        goto bad_query;
@@ -2363,7 +2366,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	    SQL_ADP_FOR_EACH(e_queue, i, ad_pkt, rid)
 	        DEBUG_U_WRAP_DEEP(LogMessage("%s: ad_p event_id %d, ad_eid %d, r_data_len %d \n", __func__,
 	                data->ms_cid, ad_pkt->event_id, ad_pkt->u2raw_datalen));
-	        if ( !dbEventInfoFm_rawdata(data, sl_buf_data, sizeof(sl_buf_data),
+	        if ( !dbEventInfoFm_rawdata(data, sl_buf_data, SQL_PKT_BUF_LEN,/*sizeof(sl_buf_data),*/
 	                data->sid, rid, ad_pkt->event_id, ad_pkt, sl_separator) )
 	            goto bad_query;
 	    SQL_ADP_FOR_EACH_END(SQLQuery, sl_buf_data, ad_pkt->u2raw_esc_len)
@@ -3931,8 +3934,7 @@ u_int32_t CommitTransaction(DatabaseData * data) {
 	}
 
 	if ((checkTransactionState(&data->dbRH[data->dbtype_id])) == 0) {
-		/* We are not in a transaction, effect of some possible nested call
-		 be quiet */
+		LogMessage(" We are not in a transaction, effect of some possible nested call be quiet ");
 		return 0;
 	}
 
@@ -3983,7 +3985,7 @@ u_int32_t CommitTransaction(DatabaseData * data) {
 	/* XXX */
 	return 1;
 
-	transaction_success:
+transaction_success:
 	/* Reset the transaction error count */
 	resetTransactionState(&data->dbRH[data->dbtype_id]);
 	return 0;
@@ -5003,7 +5005,7 @@ void Connect(DatabaseData * data) {
 
 		if (mysql_real_connect(data->m_sock, data->host, data->user,
 				data->password, data->dbname,
-				data->port == NULL ? 0 : atoi(data->port), NULL, 0) == NULL) {
+				data->port == NULL ? 0 : atoi(data->port), NULL, CLIENT_INTERACTIVE) == NULL) {
 			if (mysql_errno(data->m_sock)) {
 				LogMessage("database mysql_error: %s\n",
 						mysql_error(data->m_sock));
@@ -5622,11 +5624,11 @@ u_int32_t checkTransactionCall(dbReliabilityHandle *pdbRH) {
 	return 0;
 }
 
-u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH) {
+u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH)
+{
 	struct timespec sleepRet = { 0 };
 
 	if (pdbRH == NULL) {
-		/* XXX */
 		return 1;
 	}
 
@@ -5635,8 +5637,7 @@ u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH) {
 
 		if (nanosleep(&pdbRH->dbReconnectSleepTime, &sleepRet) < 0) {
 			perror("dbReconnectSetCounter():");
-			LogMessage(
-					"[%s() ]Call to nanosleep(): Failed with [%u] seconds left and [%u] microsecond left \n",
+			LogMessage("[%s() ]Call to nanosleep(): Failed with [%u] seconds left and [%u] microsecond left \n",
 					__FUNCTION__, sleepRet.tv_sec, sleepRet.tv_nsec);
 			return 1;
 		}
@@ -5644,6 +5645,16 @@ u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH) {
 	}
 
 	return 1;
+}
+
+u_int32_t dbReconnectReSetCounters(dbReliabilityHandle *pdbRH)
+{
+    if (pdbRH == NULL) {
+        return 1;
+    }
+
+    pdbRH->dbConnectionCount = 0;
+    return 0;
 }
 
 #ifdef ENABLE_MYSQL
@@ -5676,7 +5687,7 @@ u_int32_t MYSQL_ManualConnect(DatabaseData *dbdata) {
 
 	if (mysql_real_connect(dbdata->m_sock, dbdata->host, dbdata->user,
 			dbdata->password, dbdata->dbname,
-			dbdata->port == NULL ? 0 : atoi(dbdata->port), NULL, 0) == NULL) {
+			dbdata->port == NULL ? 0 : atoi(dbdata->port), NULL, CLIENT_INTERACTIVE) == NULL) {
 		if (mysql_errno(dbdata->m_sock))
 			LogMessage("database: mysql_error: %s\n",
 					mysql_error(dbdata->m_sock));
@@ -5713,33 +5724,28 @@ u_int32_t MYSQL_ManualConnect(DatabaseData *dbdata) {
 	return 0;
 }
 
-u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
+u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH)
+{
 	unsigned long aThreadID = 0; /* after  mysql_ping call thread_id */
 	int ping_ret = 0;
-
 	DatabaseData *dbdata = NULL;
 
 	if ((pdbRH == NULL) || (pdbRH->dbdata == NULL)) {
-		/* XXX */
 		return 1;
 	}
 
 	dbdata = pdbRH->dbdata;
-
 	if (dbdata->m_sock == NULL)
 		return 1;
 
-	MYSQL_RetryConnection:
+MYSQL_RetryConnection:
 	/* mysql_ping() could reconnect and we wouldn't know */
-
 	aThreadID = mysql_thread_id(pdbRH->dbdata->m_sock);
-
 	ping_ret = mysql_ping(pdbRH->dbdata->m_sock);
 
 	/* We might try to recover from this */
 	if (pdbRH->mysql_reconnect) {
 		switch (ping_ret) {
-
 		case 0:
 			if (aThreadID != pdbRH->pThreadID) {
 				/* mysql ping reconnected,
@@ -5747,9 +5753,8 @@ u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
 				 and if we are we bail, since the resulting issued commands would obviously fail
 				 */
 				if (dbReconnectSetCounters(pdbRH)) {
-					/* XXX */
-					FatalError(
-							"database [%s()]: Call failed, the process will need to be restarted \n",
+					FatalError("database [%s()]: Too much reconnection, "
+					        "the process will need to be restarted \n",
 							__FUNCTION__);
 				}
 
@@ -5764,7 +5769,6 @@ u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
 
 				/* make sure are are off auto_commit */
 				if (mysql_autocommit(pdbRH->dbdata->m_sock, 0)) {
-					/* XXX */
 					LogMessage("database Can't set autocommit off \n");
 					return 1;
 				}
@@ -5777,8 +5781,8 @@ u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
 					return 1;
 				}
 
-				LogMessage(
-						"Warning: {MYSQL} The database connection has reconnected it self to the database server, via a call to mysql_ping() new thread id is [%u] \n",
+				LogMessage("Warning: {MYSQL} The database connection has reconnected"
+				        " it self to the database server, via a call to mysql_ping() new thread id is [%u] \n",
 						pdbRH->pThreadID);
 				return 0;
 			} else {
@@ -5792,7 +5796,6 @@ u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
 				 */
 
 				if (mysql_autocommit(pdbRH->dbdata->m_sock, 0)) {
-					/* XXX */
 					LogMessage("database Can't set autocommit off \n");
 					return 1;
 				}
@@ -5800,80 +5803,76 @@ u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH) {
 				/* make shure we keep the option on ..*/
 				if (mysql_options(dbdata->m_sock, MYSQL_OPT_RECONNECT,
 						&pdbRH->mysql_reconnect) != 0) {
-					LogMessage("database: Failed to set reconnect option: %s\n",
-							mysql_error(dbdata->m_sock));
+					LogMessage("%s: Failed to set reconnect option: %s\n",
+							__func__, mysql_error(dbdata->m_sock));
 					return 1;
 				}
 				return 0;
 			}
 			break;
-
 		case CR_COMMANDS_OUT_OF_SYNC:
 		case CR_SERVER_GONE_ERROR:
 		case CR_UNKNOWN_ERROR:
 		default:
-
 			if (checkTransactionState(pdbRH)) {
 				/* ResetState for the caller */
+			    LogMessage("%s: reconnect, setTransactionCallFail"
+			            ", ping_ret %d\n", __func__, ping_ret);
 				setReconnectState(pdbRH, 1);
 				setTransactionCallFail(pdbRH);
 				setTransactionState(pdbRH);
 			}
 
 			if (dbReconnectSetCounters(pdbRH)) {
-				/* XXX */
-				FatalError(
-						"database [%s()]: Call failed, the process will need to be restarted \n",
+				FatalError("database [%s()]: Too much reconnection, "
+				        "the process will need to be restarted \n",
 						__FUNCTION__);
 			}
 
 			goto MYSQL_RetryConnection;
 			break;
-
 		}
-	} else /* Manual Reconnect mode */
-	{
+	}
+	else{    /* Manual Reconnect mode */
 		switch (ping_ret) {
-
 		case 0:
 			if (aThreadID != pdbRH->pThreadID) {
-				FatalError(
-						"database We are in {MYSQL} \"manual reconnect\" mode and a call to mysql_ping() changed the mysql_thread_id, this shouldn't happen the process will terminate \n");
+				FatalError("database We are in {MYSQL} \"manual reconnect\" mode "
+				        "and a call to mysql_ping() changed the mysql_thread_id, "
+				        "this shouldn't happen the process will terminate \n");
 			}
-			return 0;
-
 			break;
-
 		case CR_COMMANDS_OUT_OF_SYNC:
 		case CR_SERVER_GONE_ERROR:
 		case CR_UNKNOWN_ERROR:
 		default:
-
 			if (checkTransactionState(pdbRH)) {
 				/* ResetState for the caller */
-				setReconnectState(pdbRH, 1);
-				setTransactionCallFail(pdbRH);
-				setTransactionState(pdbRH);
+			    LogMessage("%s: no_reconnect(no setTransactionCallFail)"
+			            ", ping_ret %d\n", __func__, ping_ret);
+			    setReconnectState(pdbRH, 1);
+			    //setTransactionCallFail(pdbRH);
+			    setTransactionState(pdbRH);
 			}
 
 			if (dbReconnectSetCounters(pdbRH)) {
-				/* XXX */
-				FatalError(
-						"database [%s()]: Call failed, the process will need to be restarted \n",
+				FatalError("database [%s()]: Too much reconnection, "
+				        "the process will need to be restarted \n",
 						__FUNCTION__);
 			}
 
 			if ((MYSQL_ManualConnect(pdbRH->dbdata))) {
 				goto MYSQL_RetryConnection;
 			}
+
+			dbReconnectReSetCounters(pdbRH);
+			break;
 		}
 		return 0;
 	}
 
-	/* XXX */
 	LogMessage("[%s()], Reached a point of no return ...it shouldn't happen \n",
 			__FUNCTION__);
-
 	return 1;
 }
 #endif

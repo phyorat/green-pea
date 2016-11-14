@@ -818,34 +818,37 @@ void ParseSidMapLine(Barnyard2Config *bc, char *data)
 	    switch(bc->sidmap_version)
 	    {
 	    case SIDMAPV1:
-		switch(i)
-		{
-                case 0: /* sid */
-                    t_sn.generator = 1;
-		    if( (t_sn.id = strtoul(idx, NULL, 10)) == ULONG_MAX)
-		    {
-			FatalError("[%s()], error converting integer [%s] for line [%s] \n",
-				   __FUNCTION__,
-				   strerror(errno),
-				   data);
-		    }
-		    break;
-		    
-                case 1: /* msg */
-                    if( (t_sn.msg = SnortStrdup(idx)) == NULL)
-		    {
-			FatalError("[%s()], error converting string for line [%s] \n",
-				   __FUNCTION__,
-				   data);
-		    }
-                    break;
-		    
-                default: /* reference data */
-                    ParseReference(bc, idx, &t_sn);
-                    break;
-		}
-		break;
-		
+	        switch(i)
+	        {
+	        case 0: /* sid */
+	            t_sn.generator = 1;
+	            if( (t_sn.id = strtoul(idx, NULL, 10)) == ULONG_MAX) {
+	                FatalError("[%s()], error converting integer [%s] for line [%s] \n",
+	                        __FUNCTION__,
+	                        strerror(errno),
+	                        data);
+	            }
+	            break;
+	        case 1: /* rev */
+	            if( (t_sn.rev = strtoul(idx, NULL, 10)) == ULONG_MAX) {
+	                FatalError("[%s()], error converting integer [%s] for line [%s] \n",
+	                        __FUNCTION__,
+	                        strerror(errno),
+	                        data);
+	            }
+	            break;
+	        case 2: /* msg */
+	            if( (t_sn.msg = SnortStrdup(idx)) == NULL) {
+	                FatalError("[%s()], error converting string for line [%s] \n",
+	                        __FUNCTION__,
+	                        data);
+	            }
+	            break;
+	        default: /* reference data */
+	            ParseReference(bc, idx, &t_sn);
+	            break;
+	        }
+	        break;
 	    case SIDMAPV2:
 
 		switch(i)

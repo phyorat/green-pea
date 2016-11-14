@@ -201,6 +201,8 @@ extern int opterr;
 extern int optopt;
 
 /* Private function prototypes ************************************************/
+int SquirrelMain(int argc, char *argv[]);
+
 static void InitNetmasks(void);
 static void InitProtoNames(void);
 
@@ -350,6 +352,9 @@ int SquirrelMain(int argc, char *argv[])
     FatalError("Could not Initialize Winsock!\n");
 #endif
 
+    //create a thread ,send hello to manager every 30 seconds
+    InitHeartBeat();
+
     restart:
 
     Barnyard2Init(argc, argv);
@@ -397,9 +402,6 @@ int SquirrelMain(int argc, char *argv[])
          "file '%s'\n", barnyard2_conf->waldo.filepath);
          }*/
     }
-
-    //create a thread ,send hello to manager every 30 seconds
-    InitHeartBeat();
 
     /* Batch processing mode */
     if (BcBatchMode()) {

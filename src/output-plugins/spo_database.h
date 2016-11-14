@@ -114,10 +114,11 @@ typedef SQLCHAR ODBC_SQLCHAR;
 #define MAX_SQL_QUERY_LENGTH_DATA	8//(0x4B000)//Deprecated Bufffer
 
 #define MAX_SQL_QUERY_ADDATA_OPS      1
-#define MAX_SQL_QUERY_LENGTH_ADDATA   (0x800000)
+#define MAX_SQL_QUERY_LENGTH_ADDATA   (0x4000000)//(0x800000)
 
+#define SQL_PKT_BUF_LEN         0x10000
 #define SQL_EVENT_QUEUE_LEN     1000
-#define SQL_PKT_QUEUE_LEN     1000
+#define SQL_PKT_QUEUE_LEN       1000
 
 /******** Data Types  **************************************************/
 /* enumerate the supported databases */
@@ -426,6 +427,7 @@ typedef struct __SQLEventQueue {
     uint16_t ele_cnt;
     uint16_t ele_exp_cnt;
 //    uint8_t event_id_1_cnt[BY_MUL_TR_DEFAULT];
+    char ele_pktbuf[SQL_PKT_BUF_LEN];
     SQLEvent ele[SQL_EVENT_QUEUE_LEN];
     SQLPkt ele_expkt[SQL_PKT_QUEUE_LEN];
 }SQLEventQueue;
