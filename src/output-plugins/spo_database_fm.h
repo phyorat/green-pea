@@ -17,14 +17,14 @@ uint8_t dbEventInfoFm_tcpdata(char *buf, int slen, int sid, uint8_t rid, us_cid_
 uint8_t dbEventInfoFm_udp(char *buf, int slen, int detail);
 uint8_t dbEventInfoFm_udpdata(char *buf, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator, int detail);
 uint8_t dbEventInfoFm_tcpopt(char *buf, int slen);
-uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data, SQLQueryEle *squery, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator);
+uint8_t dbEventInfoFm_tcpoptdata(DatabaseData*, SQLQueryEle*, int, int, uint8_t, us_cid_t, Packet*, char, uint8_t);
 uint8_t dbEventInfoFm_ip(char *buf, int slen, int detail);
 uint8_t dbEventInfoFm_ipdata(char *buf, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator, int detail);
 uint8_t dbEventInfoFm_ipopt(char *buf, int slen);
-uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data, SQLQueryEle *squery, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator);
+uint8_t dbEventInfoFm_ipoptdata(DatabaseData*, SQLQueryEle*, int, int, uint8_t, us_cid_t, Packet*, char, uint8_t);
 uint8_t dbEventInfoFm_payload(char *buf, int slen);
-uint8_t dbEventInfoFm_payloaddata(DatabaseData *data, char *sbuf, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator);
+uint8_t dbEventInfoFm_payloaddata(DatabaseData*, char*, int, int, uint8_t, us_cid_t, Packet*, char, uint8_t);
 uint8_t dbEventInfoFm_raw(char *buf, int slen);
-uint8_t dbEventInfoFm_rawdata(DatabaseData *data, char *sbuf, int slen, int sid, uint8_t rid, us_cid_t cid, SQLPkt *adp, char sl_separator);
+uint8_t dbEventInfoFm_rawdata(DatabaseData*, char*, int, int, uint8_t, us_cid_t, SQLPkt*, char, uint8_t);
 
 #endif	/* __SPO_DATABASE_FM_H__ */

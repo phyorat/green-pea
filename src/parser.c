@@ -2207,27 +2207,34 @@ void ConfigSpoolFilebase(Barnyard2Config *bc, char *args)
 
 void ConfigSpoolDirectory(Barnyard2Config *bc, char *args)
 {
-    uint8_t t_index;
+    uint8_t t_index = 0;
+    uint64_t lcore = 0;
     char str[MAX_FILEPATH_BUF];
 
     if ((args == NULL) || (bc == NULL) )
         return;
 
-    sscanf(args, "%*s %hhu", &t_index);
+    if ( 3 !=  sscanf(args, "%s tid=%hhu lcore=%lx", str, &t_index, &lcore) ) {
+        LogMessage("Squirrel: No cpuset for Spool Config[%d]?\n", t_index);
+        if ( 2 !=  sscanf(args, "%s tid=%hhu", str, &t_index) ) {
+            FatalError("Squirrel: Invalid Spool Config!\n");
+            return;
+        }
+    }
 
     if ( t_index >= BY_MUL_TR_DEFAULT ) {
-        FatalError("barnyard2: invalid sub-thread index, %hhu\n", t_index);
+        FatalError("Squirrel: invalid sub-thread index, %hhu\n", t_index);
         return;
     }
 
-    sscanf(args, "%s %*d", str);
-
     if ( SnortSnprintf(bc->waldos[t_index].data.spool_dir, STD_BUF, "%s", str) != SNORT_SNPRINTF_SUCCESS )
-        FatalError("barnyard2: spool directory too long\n");
+        FatalError("Squirrel: spool directory too long\n");
 
-    LogMessage("%s: spooler dir for thread %d: %s\n", __func__, t_index, bc->waldos[t_index].data.spool_dir);
+    LogMessage("%s: spooler dir for thread %d, lcore_id 0x%lx: %s\n", __func__,
+            t_index, lcore, bc->waldos[t_index].data.spool_dir);
     bc->run_mode_flags |= RUN_MODE_FLAG__CONTINUOUS;
     bc->trbit_valid |= (0x01<<t_index);
+    bc->tr_lcore[t_index] = lcore;
 }
 
 void ConfigSpoolDirectoryTr(Barnyard2Config *bc, char *args, uint8_t t_index)

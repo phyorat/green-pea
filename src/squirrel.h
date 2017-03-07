@@ -65,8 +65,6 @@
 #define VER_REVISION	"15"
 #define VER_BUILD	"116"
 
-#define BY_MAX_SNORT_INSTANCE             8
-
 #define STD_BUF  1024
 
 #define MAX_PIDFILE_SUFFIX 11 /* uniqueness extension to PID file, see '-R' */
@@ -143,13 +141,26 @@
 #define SIDMAPV2 0x02
 /* SIDMAP V2 */
 
+#define BY_MAX_SNORT_INSTANCE             16
+
 /* Multi Thread Support */
 #define BY_MUL_TR_DEFAULT       BY_MAX_SNORT_INSTANCE       //default number of read thread
-#define BY_MUL_TR_BITMASK       (0x07)
+#define BY_MUL_TR_BITMASK       (BY_MUL_TR_DEFAULT-1)
 #define BY_MUK_TR_PLUSONE(num)  (((num)+1)&BY_MUL_TR_BITMASK)
 
 //#define BY_FAKE_DATA_RE_CNT     0x1FFFF
 //#define BY_FAKE_DATA_RE_BITS    17
+
+//DB Output Setup
+#define SQL_ELEQUE_INS_MAX                   (1<<3)
+#define SQL_ELEQUE_INS_MASK                  (SQL_ELEQUE_INS_MAX-1)   //Corresponding to MAX
+#define SQL_ELEQUE_INS_PLUS_ONE(ins)         (((ins)+1) & SQL_ELEQUE_INS_MASK)
+
+#define SQL_QUERY_SOCK_MAX                   (1<<3)
+
+#define SPOOLER_ELEQUE_RTO_MAX               (SQL_ELEQUE_INS_MAX<<3)
+#define SPOOLER_ELEQUE_RTO_MASK              (SPOOLER_ELEQUE_RTO_MAX-1)   //Corresponding to MAX
+#define SPOOLER_ELEQUE_RTO_PLUS_ONE(rto)     (((rto)+1) & SPOOLER_ELEQUE_RTO_MASK)
 
 /* This macro helps to simplify the differences between Win32 and
    non-Win32 code when printing out the name of the interface */
@@ -376,7 +387,8 @@ typedef struct _Barnyard2Config
     int process_new_records_only_flag;
 
     /* Multi thread support */
-    uint8_t trbit_valid;
+    uint32_t trbit_valid;
+    uint64_t tr_lcore[BY_MUL_TR_DEFAULT];    //Support Maximum 64 cores
     Waldo waldos[BY_MUL_TR_DEFAULT];
     uint8_t waldo_state;
     char spool_filebase[MAX_FILEPATH_BUF];
@@ -443,10 +455,24 @@ typedef struct _Barnyard2Config
 
 typedef struct __by_mul_tread_para
 {
-    uint8_t trbit_valid;
+    uint32_t trbit_valid;
     Barnyard2Config *by_conf;
     spooler_r_para s_para[BY_MUL_TR_DEFAULT];
 }by_mul_tread_para;
+
+typedef struct __RingTopOct
+{
+    uint8_t r_id;
+    uint8_t r_flag;                     //1, handling; 0, process done
+    uint16_t r_top[BY_MUL_TR_DEFAULT];
+}RingTopOct;
+
+typedef struct __EventRingTopOcts
+{
+    uint8_t mque_fi;
+    uint8_t mque_fo;
+    RingTopOct rings2mque[SPOOLER_ELEQUE_RTO_MAX];
+}EventRingTopOcts;
 
 /* struct to collect packet statistics */
 typedef struct _PacketCount

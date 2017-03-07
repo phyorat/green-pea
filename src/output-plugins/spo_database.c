@@ -35,6 +35,14 @@
  *
  */
 
+#include "jhash.h"
+#include "spo_database.h"
+#include "spo_database_fm.h"
+
+#define __USE_GNU
+#include <pthread.h>
+
+
 /******** fatals *******************************************************/
 
 /* these strings deliberately break fatal error messages into
@@ -98,26 +106,25 @@ static const char* FATAL_NO_SUPPORT_2 =
 				"See the database documentation for cursory details (doc/README.database).\n"
 				"and the URL to the most recent database plugin documentation.\n";
 
-#include "spo_database.h"
-#include "spo_database_fm.h"
+static SQLEventQueue *spo_db_event_queue[SQL_ELEQUE_INS_MAX] = {NULL};
 
-static SQLEventQueue *spo_db_event_queue[SQL_QUERY_INS_MAX] = {NULL};
+int Spo_ProcQuery_GetQins(DatabaseData *spo_data, const uint8_t ins_base);
 
-void DatabaseCleanSelect(DatabaseData *data) {
+void DatabaseCleanSelect(DatabaseData *data, uint8_t q_sock) {
 
-	if ((data != NULL) && (data->SQL_SELECT) != NULL
+	if ((data != NULL) && (data->SQL_SELECT[q_sock]) != NULL
 			&& (data->SQL_SELECT_SIZE > 0)) {
-		memset(data->SQL_SELECT, '\0', data->SQL_SELECT_SIZE);
+		memset(data->SQL_SELECT[q_sock], '\0', data->SQL_SELECT_SIZE);
 	}
 
 	return;
 }
 
-void DatabaseCleanInsert(DatabaseData *data) {
+void DatabaseCleanInsert(DatabaseData *data, uint8_t q_sock) {
 
-	if ((data != NULL) && (data->SQL_INSERT) != NULL
+	if ((data != NULL) && (data->SQL_INSERT[q_sock]) != NULL
 			&& (data->SQL_INSERT_SIZE > 0)) {
-		memset(data->SQL_INSERT, '\0', data->SQL_INSERT_SIZE);
+		memset(data->SQL_INSERT[q_sock], '\0', data->SQL_INSERT_SIZE);
 	}
 
 	return;
@@ -130,13 +137,17 @@ u_int32_t SQL_Initialize(DatabaseData *data)
 	u_int32_t x = 0;
     int err;
     SQLQueryList *pl_query;
+    cpu_set_t cpuset;
 
     if (data == NULL) {
         return 1;
     }
 
-	for (i=0; i<SQL_QUERY_INS_MAX; i++) {
-	    pl_query = &(data->lquery_ins[i].lsql_query);
+    CPU_ZERO(&cpuset);
+    cpuset.__bits[0] = data->cpuset_bm;
+
+	for (i=0; i<SQL_ELEQUE_INS_MAX; i++) {
+	    pl_query = &(data->lEleQue_ins[i].lsql_query);
 
 	    if ((pl_query->query_array = (SQLQueryEle *) SnortAlloc(
 	            (sizeof(SQLQueryEle) * MAX_SQL_QUERY_OPS))) == NULL) {
@@ -174,38 +185,52 @@ u_int32_t SQL_Initialize(DatabaseData *data)
 	        }
 	    }
 
-	    if (pipe(data->lquery_ins[i].pipe_data2queue) < 0
-	            || pipe(data->lquery_ins[i].pipe_queue2data) < 0
-	            || pipe(data->lquery_ins[i].pipe_queue2query) < 0
-	            || pipe(data->lquery_ins[i].pipe_query2queue) < 0 ) {
+	    if (pipe(data->lEleQue_ins[i].pipe_data2queue) < 0
+	            || pipe(data->lEleQue_ins[i].pipe_queue2data) < 0
+	            || pipe(data->lEleQue_ins[i].pipe_queue2query) < 0
+	            || pipe(data->lEleQue_ins[i].pipe_query2queue) < 0 ) {
 	        perror("Cannot create pipe\n");
 	        return 1;
 	    }
 
-	    LogMessage("%s: initial event_queue[%d]\n", __func__, i);
+	    LogMessage("%s: initial event_queue[%d], cpuset 0x%lx\n", __func__,
+	            i, data->cpuset_bm);
 	    spo_db_event_queue[i] = (SQLEventQueue*)SnortAlloc(sizeof(SQLEventQueue));
 	    memset(spo_db_event_queue[i], 0, sizeof(SQLEventQueue));
 
-	    data->lquery_ins[i].ql_index = i; //Just for initialization of enc_sql thread.
-        data->lquery_ins[i].ql_switch = 1;
-        data->lquery_ins[i].lq_stat = LQ_PRE_QUEUE;
-        data->lquery_ins[i].spo_data = data;
+	    data->lEleQue_ins[i].ql_index = i; //Just for initialization of enc_sql thread.
+        data->lEleQue_ins[i].ql_switch = 1;
+        data->lEleQue_ins[i].lq_stat = LQ_PRE_QUEUE;
+        data->lEleQue_ins[i].spo_data = data;
 
         pthread_mutex_init(&data->lquery_lock, NULL);
+        pthread_mutex_init(&data->lsiginfo_lock, NULL);
 
-        err = pthread_create(&data->lquery_ins[i].tid_enc_sql,
-                NULL, &Spo_EncodeSql, (void*)(&data->lquery_ins[i]));
+        err = pthread_create(&data->lEleQue_ins[i].tid_enc_sql,
+                NULL, &Spo_EncodeSql, (void*)(&data->lEleQue_ins[i]));
         if (0 != err) {
             LogMessage("Can't create Spo_E thread %d: [%s]\n", i, strerror(err));
             return 1;
         }
-	}
 
-    err = pthread_create(&data->tid_query, NULL, &Spo_ProcQuery, (void*)data);
-    if (0 != err) {
-        LogMessage("Can't create Spo_Q: [%s]\n", strerror(err));
-        return 1;
-    }
+        if ( data->cpuset_bm ) {
+            err = pthread_setaffinity_np(data->lEleQue_ins[i].tid_enc_sql, sizeof(cpu_set_t), &cpuset);
+            if ( 0 != err )
+                handle_error_en(err, "pthread_setaffinity_np");
+        }
+	}
+#ifdef IF_SPO_QUERY_IN_THREAD
+	for (i=0; i<SQL_QUERY_SOCK_MAX; i++) {
+	    err = pthread_create(&data->tid_query[i], NULL, &Spo_ProcQuery, (void*)(&data->m_dbins[i]));
+	    if (0 != err) {
+	        LogMessage("Can't create Spo_Q: [%s]\n", strerror(err));
+	        return 1;
+	    }
+	}
+#endif
+
+	//First queue
+	data->enc_q_ins = Spo_ProcQuery_GetQins(data, 0);
 
 	return 0;
 }
@@ -220,12 +245,13 @@ u_int32_t SQL_Finalize(DatabaseData *data)
 		return 1;
 	}
 
-    for (i=0; i<SQL_QUERY_INS_MAX; i++) {
-        pl_query = &(data->lquery_ins[i].lsql_query);
+    for (i=0; i<SQL_ELEQUE_INS_MAX; i++) {
+        pl_query = &(data->lEleQue_ins[i].lsql_query);
 
+        pthread_mutex_destroy(&data->lsiginfo_lock);
         pthread_mutex_destroy(&data->lquery_lock);
 
-        data->lquery_ins[i].ql_switch = 0;
+        data->lEleQue_ins[i].ql_switch = 0;
 
         if (pl_query->query_array != NULL) {
             for (x = 0; x < MAX_SQL_QUERY_OPS; x++) {
@@ -270,7 +296,7 @@ u_int32_t SQL_Finalize(DatabaseData *data)
 	return 0;
 }
 
-SQLQueryEle *SQL_GetNextQuery(DatabaseData *data, uint8_t q_ins)
+SQLQueryEle *SQL_GetNextQuery(DatabaseData *data, uint8_t ele_que_ins)
 {
     SQLQueryList *pl_query;
 	SQLQueryEle *ret_query = NULL;
@@ -279,7 +305,7 @@ SQLQueryEle *SQL_GetNextQuery(DatabaseData *data, uint8_t q_ins)
 		return NULL;
 	}
 
-	pl_query = &(data->lquery_ins[q_ins].lsql_query);
+	pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
 	if (pl_query->query_count < MAX_SQL_QUERY_OPS) {
 		ret_query = &(pl_query->query_array[pl_query->query_count]);
@@ -293,7 +319,7 @@ SQLQueryEle *SQL_GetNextQuery(DatabaseData *data, uint8_t q_ins)
 	return NULL;
 }
 
-SQLQueryEle *SQL_GetNextQueryData(DatabaseData *data, uint8_t q_ins)
+SQLQueryEle *SQL_GetNextQueryData(DatabaseData *data, uint8_t ele_que_ins)
 {
     SQLQueryList *pl_query;
 	SQLQueryEle *ret_query = NULL;
@@ -302,7 +328,7 @@ SQLQueryEle *SQL_GetNextQueryData(DatabaseData *data, uint8_t q_ins)
 		return NULL;
 	}
 
-	pl_query = &(data->lquery_ins[q_ins].lsql_query);
+	pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
 	if (pl_query->query_count_data < MAX_SQL_QUERY_DATA_OPS) {
 		ret_query = &(pl_query->query_array_data[pl_query->query_count_data]);
@@ -314,7 +340,7 @@ SQLQueryEle *SQL_GetNextQueryData(DatabaseData *data, uint8_t q_ins)
 	return NULL;
 }
 
-SQLQueryEle *SQL_GetNextQueryAdData(DatabaseData *data, uint8_t q_ins)
+SQLQueryEle *SQL_GetNextQueryAdData(DatabaseData *data, uint8_t ele_que_ins)
 {
     SQLQueryList *pl_query;
     SQLQueryEle *ret_query = NULL;
@@ -323,7 +349,7 @@ SQLQueryEle *SQL_GetNextQueryAdData(DatabaseData *data, uint8_t q_ins)
         return NULL;
     }
 
-    pl_query = &(data->lquery_ins[q_ins].lsql_query);
+    pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
     if (pl_query->query_count_ad_data < MAX_SQL_QUERY_DATA_OPS) {
         ret_query = &(pl_query->query_array_ad_data[pl_query->query_count_ad_data]);
@@ -335,7 +361,7 @@ SQLQueryEle *SQL_GetNextQueryAdData(DatabaseData *data, uint8_t q_ins)
     return NULL;
 }
 
-SQLQueryEle *SQL_GetQueryByPos(DatabaseData *data, uint8_t q_ins, u_int32_t pos)
+SQLQueryEle *SQL_GetQueryByPos(DatabaseData *data, uint8_t ele_que_ins, u_int32_t pos)
 {
     SQLQueryList *pl_query;
 
@@ -343,7 +369,7 @@ SQLQueryEle *SQL_GetQueryByPos(DatabaseData *data, uint8_t q_ins, u_int32_t pos)
 		return NULL;
 	}
 
-	pl_query = &(data->lquery_ins[q_ins].lsql_query);
+	pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
 	if (pl_query->query_array[pos].string != NULL) {
 		return &(pl_query->query_array[pos]);
@@ -352,7 +378,7 @@ SQLQueryEle *SQL_GetQueryByPos(DatabaseData *data, uint8_t q_ins, u_int32_t pos)
 	return NULL;
 }
 
-SQLQueryEle *SQL_GetQueryDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_t pos)
+SQLQueryEle *SQL_GetQueryDataByPos(DatabaseData *data, uint8_t ele_que_ins, u_int32_t pos)
 {
     SQLQueryList *pl_query;
 
@@ -360,7 +386,7 @@ SQLQueryEle *SQL_GetQueryDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_t 
 		return NULL;
 	}
 
-	pl_query = &(data->lquery_ins[q_ins].lsql_query);
+	pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
 	if (pl_query->query_array_data[pos].string != NULL) {
 		return &(pl_query->query_array_data[pos]);
@@ -369,7 +395,7 @@ SQLQueryEle *SQL_GetQueryDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_t 
 	return NULL;
 }
 
-SQLQueryEle *SQL_GetQueryAdDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_t pos)
+SQLQueryEle *SQL_GetQueryAdDataByPos(DatabaseData *data, uint8_t ele_que_ins, u_int32_t pos)
 {
     SQLQueryList *pl_query;
 
@@ -377,7 +403,7 @@ SQLQueryEle *SQL_GetQueryAdDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_
         return NULL;
     }
 
-    pl_query = &(data->lquery_ins[q_ins].lsql_query);
+    pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
     if (pl_query->query_array_ad_data[pos].string != NULL) {
         return &(pl_query->query_array_ad_data[pos]);
@@ -386,34 +412,34 @@ SQLQueryEle *SQL_GetQueryAdDataByPos(DatabaseData *data, uint8_t q_ins, u_int32_
     return NULL;
 }
 
-u_int32_t SQL_GetMaxQuery(DatabaseData *data, uint8_t q_ins)
+u_int32_t SQL_GetMaxQuery(DatabaseData *data, uint8_t ele_que_ins)
 {
 	if (data == NULL) {
 		return 0;
 	}
 
-	return data->lquery_ins[q_ins].lsql_query.query_count;
+	return data->lEleQue_ins[ele_que_ins].lsql_query.query_count;
 }
 
-u_int32_t SQL_GetMaxQueryData(DatabaseData *data, uint8_t q_ins)
+u_int32_t SQL_GetMaxQueryData(DatabaseData *data, uint8_t ele_que_ins)
 {
 	if (data == NULL) {
 		return 0;
 	}
 
-	return data->lquery_ins[q_ins].lsql_query.query_count_data;
+	return data->lEleQue_ins[ele_que_ins].lsql_query.query_count_data;
 }
 
-u_int32_t SQL_GetMaxQueryAdData(DatabaseData *data, uint8_t q_ins)
+u_int32_t SQL_GetMaxQueryAdData(DatabaseData *data, uint8_t ele_que_ins)
 {
     if (data == NULL) {
         return 0;
     }
 
-    return data->lquery_ins[q_ins].lsql_query.query_count_ad_data;
+    return data->lEleQue_ins[ele_que_ins].lsql_query.query_count_ad_data;
 }
 
-u_int32_t SQL_Cleanup(DatabaseData *data, uint8_t q_ins)
+u_int32_t SQL_Cleanup(DatabaseData *data, uint8_t ele_que_ins)
 {
 	u_int32_t x = 0;
 	SQLQueryList *pl_query;
@@ -423,7 +449,7 @@ u_int32_t SQL_Cleanup(DatabaseData *data, uint8_t q_ins)
 	}
 
 
-    pl_query = &(data->lquery_ins[q_ins].lsql_query);
+    pl_query = &(data->lEleQue_ins[ele_que_ins].lsql_query);
 
     if (pl_query->query_count) {
         for (x = 0; x < pl_query->query_count; x++) {
@@ -486,6 +512,13 @@ void dbEventQueueClean(uint8_t q_ins)
 {
     spo_db_event_queue[q_ins]->ele_cnt = 0;
     spo_db_event_queue[q_ins]->ele_exp_cnt = 0;
+
+    //Set free flag from input_rings
+    if ( NULL != spo_db_event_queue[q_ins]->ele_rtOct ) {
+        spo_db_event_queue[q_ins]->ele_rtOct->r_flag = 0;
+        spo_db_event_queue[q_ins]->ele_rtOct = NULL;
+    }
+
 //    spo_db_event_queue[q_ins]->qe_switch = 0;
     /*  memset(spo_db_event_queue->event_id_1_cnt,
                 0, sizeof(spo_db_event_queue->event_id_1_cnt));*/
@@ -519,7 +552,7 @@ u_int32_t SynchronizeEventId(DatabaseData *data)
 
 	GetLastCidFromTable(data);
 
-	if (UpdateLastCid(data, 1, 1) < 0) {
+	if (UpdateLastCid(data, 1, 1, SPO_DB_DEF_INS) < 0) {
 		FatalError("database Unable to construct query - output error or truncation\n");
 	}
 
@@ -672,7 +705,9 @@ void DatabasePluginPrintData(DatabaseData *data) {
  * Returns: void function
  *
  ******************************************************************************/
-void DatabaseInit(char *args) {
+void DatabaseInit(char *args)
+{
+    uint8_t i;
 	DatabaseData *data = NULL;
 
 	/* parse the argument list from the rules file */
@@ -691,7 +726,7 @@ void DatabaseInit(char *args) {
 	case DB_MYSQL:
 		data->dbRH[data->dbtype_id].dbConnectionStatus =
 				dbConnectionStatusMYSQL;
-		data->dbRH[data->dbtype_id].dbConnectionCount = 0;
+		//data->dbRH[data->dbtype_id].dbConnectionCount = 0;
 		break;
 #endif /* ENABLE_MYSQL */
 
@@ -742,23 +777,25 @@ void DatabaseInit(char *args) {
 	data->SQL_INSERT_SIZE = (MAX_QUERY_LENGTH * sizeof(char));
 	data->SQL_SELECT_SIZE = (MAX_QUERY_LENGTH * sizeof(char));
 
-	if ((data->SQL_INSERT = malloc(data->SQL_INSERT_SIZE)) == NULL) {
-		/* XXX */
-		FatalError(
-				"database [%s()], unable to allocate SQL_INSERT memory, bailing \n",
-				__FUNCTION__);
+	for ( i=0; i<SQL_QUERY_SOCK_MAX; i++ ) {
+	    if ((data->SQL_INSERT[i] = malloc(data->SQL_INSERT_SIZE)) == NULL) {
+	        /* XXX */
+	        FatalError(
+	                "database [%s()], unable to allocate SQL_INSERT memory, bailing \n",
+	                __FUNCTION__);
+	    }
+
+	    if ((data->SQL_SELECT[i] = malloc(data->SQL_SELECT_SIZE)) == NULL) {
+	        /* XXX */
+	        FatalError(
+	                "database [%s()], unable to allocate SQL_SELECT memory, bailing \n",
+	                __FUNCTION__);
+
+	    }
+
+	    DatabaseCleanSelect(data, i);
+	    DatabaseCleanInsert(data, i);
 	}
-
-	if ((data->SQL_SELECT = malloc(data->SQL_SELECT_SIZE)) == NULL) {
-		/* XXX */
-		FatalError(
-				"database [%s()], unable to allocate SQL_SELECT memory, bailing \n",
-				__FUNCTION__);
-
-	}
-
-	DatabaseCleanSelect(data);
-	DatabaseCleanInsert(data);
 
 	return;
 }
@@ -794,8 +831,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
     for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
         if (data->ignore_bpf == 0) {
             if (barnyard2_conf->bpf_filter == NULL) {
-                DatabaseCleanInsert(data);
-                if ((SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+                DatabaseCleanInsert(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], data->SQL_INSERT_SIZE,
                         "INSERT INTO sensor (sid, hostname, interface, bid, detail, encoding, last_cid, last_mcid) "
                                 "VALUES (%u,'%s','%s',%u,%u,%u, 0, 0);", 1, escapedSensorName,
                         escapedInterfaceName, i, data->detail, data->encoding))
@@ -805,8 +842,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                     goto exit_funct;
                 }
 
-                DatabaseCleanSelect(data);
-                if ((SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+                DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
                         "SELECT sid "
                                 "  FROM sensor "
                                 " WHERE hostname = '%s' "
@@ -825,8 +862,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                 escapedBPFFilter = snort_escape_string(barnyard2_conf->bpf_filter,
                         data);
 
-                DatabaseCleanInsert(data);
-                if ((SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+                DatabaseCleanInsert(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], data->SQL_INSERT_SIZE,
                         "INSERT INTO sensor (sid,hostname, interface, bid, filter, detail, encoding, last_cid, last_mcid) "
                                 "VALUES (%u,'%s','%s',%u,'%s',%u,%u, 0, 0);",
                         1, escapedSensorName, escapedInterfaceName, i, escapedBPFFilter,
@@ -835,8 +872,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                     goto exit_funct;
                 }
 
-                DatabaseCleanSelect(data);
-                if ((SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+                DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
                         "SELECT sid "
                                 "  FROM sensor "
                                 " WHERE hostname = '%s' "
@@ -856,8 +893,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
         else /* ( data->ignore_bpf == 1 ) */
         {
             if (barnyard2_conf->bpf_filter == NULL) {
-                DatabaseCleanInsert(data);
-                if ((SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+                DatabaseCleanInsert(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], data->SQL_INSERT_SIZE,
                         "INSERT INTO sensor (sid,hostname, interface, bid, detail, encoding, last_cid, last_mcid) "
                                 "VALUES (%u,'%s','%s',%u,%u,%u, 0, 0);", escapedSensorName,
                         1, escapedInterfaceName, i, data->detail, data->encoding))
@@ -867,8 +904,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                     goto exit_funct;
                 }
 
-                DatabaseCleanSelect(data);
-                if ((SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+                DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
                         "SELECT sid "
                                 "  FROM sensor "
                                 " WHERE hostname = '%s' "
@@ -886,8 +923,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                 escapedBPFFilter = snort_escape_string(barnyard2_conf->bpf_filter,
                         data);
 
-                DatabaseCleanInsert(data);
-                if ((SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+                DatabaseCleanInsert(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], data->SQL_INSERT_SIZE,
                         "INSERT INTO sensor (sid,hostname, interface, bid, filter, detail, encoding, last_cid, last_mcid) "
                                 "VALUES (%u,'%s','%s',%u,'%s',%u,%u, 0, 0);",
                         1, escapedSensorName, escapedInterfaceName, i, escapedBPFFilter,
@@ -897,8 +934,8 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
                     goto exit_funct;
                 }
 
-                DatabaseCleanSelect(data);
-                if ((SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+                DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+                if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
                         "SELECT sid "
                                 "  FROM sensor "
                                 " WHERE hostname = '%s' "
@@ -916,37 +953,37 @@ u_int32_t DatabasePluginInitializeSensor(DatabaseData *data)
         }
 
         /* No check here */
-        Select(data->SQL_SELECT, data, (u_int32_t *) &data->sid);
+        Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, (u_int32_t *) &data->sid, SPO_DB_DEF_INS);
 
         if (data->sid == 0) {
-            if (BeginTransaction(data)) {
+            if (BeginTransaction(data, SPO_DB_DEF_INS)) {
                 /* XXX */
                 FatalError(
                         "database [%s()]: Failed to Initialize transaction, bailing ... \n",
                         __FUNCTION__);
             }
 
-            if (Insert(data->SQL_INSERT, data, 1)) {
+            if (Insert(data->SQL_INSERT[SPO_DB_DEF_INS], data, 1, SPO_DB_DEF_INS)) {
                 /* XXX */
-                FatalError("database Error inserting [%s] \n", data->SQL_INSERT);
+                FatalError("database Error inserting [%s] \n", data->SQL_INSERT[SPO_DB_DEF_INS]);
             }
 
-            if (CommitTransaction(data)) {
+            if (CommitTransaction(data, SPO_DB_DEF_INS)) {
                 /* XXX */
                 ErrorMessage(
                         "ERROR database: [%s()]: Error commiting transaction \n",
                         __FUNCTION__);
 
-                setTransactionCallFail(&data->dbRH[data->dbtype_id]);
+                setTransactionCallFail(&data->m_dbins[SPO_DB_DEF_INS]);
                 retval = 1;
                 goto exit_funct;
             } else {
-                resetTransactionState(&data->dbRH[data->dbtype_id]);
+                resetTransactionState(&data->m_dbins[SPO_DB_DEF_INS]);
             }
 
-            if (Select(data->SQL_SELECT, data, (u_int32_t *) &data->sid)) {
+            if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, (u_int32_t *) &data->sid, SPO_DB_DEF_INS)) {
                 /* XXX */
-                FatalError("database Error Executing [%s] \n", data->SQL_SELECT);
+                FatalError("database Error Executing [%s] \n", data->SQL_SELECT[SPO_DB_DEF_INS]);
             }
 
             if (data->sid == 0) {
@@ -977,14 +1014,18 @@ exit_funct:
 	return retval;
 }
 
-void DatabaseInitFinalize(int unused, void *arg) {
+void DatabaseInitFinalize(int unused, void *arg)
+{
+    uint8_t i;
 	DatabaseData *data = (DatabaseData *) arg;
 
 	if ((data == NULL)) {
 		FatalError("database data uninitialized\n");
 	}
 
-	Connect(data);
+    for ( i=0; i<SQL_QUERY_SOCK_MAX; i++ ) {
+        Connect(data, i);
+    }
 
 	if ((ConvertDefaultCache(barnyard2_conf, data))) {
 		/* XXX */
@@ -1154,26 +1195,27 @@ void ParseDatabaseArgs(DatabaseData *data) {
 	while (dbarg != NULL) {
 		a1 = NULL;
 		a1 = strtok(NULL, ", ");
+
 		if (!strncasecmp(dbarg, KEYWORD_HOST, strlen(KEYWORD_HOST))) {
 			data->host = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_PORT, strlen(KEYWORD_PORT))) {
+		else if (!strncasecmp(dbarg, KEYWORD_PORT, strlen(KEYWORD_PORT))) {
 			data->port = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_USER, strlen(KEYWORD_USER))) {
+		else if (!strncasecmp(dbarg, KEYWORD_USER, strlen(KEYWORD_USER))) {
 			data->user = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_PASSWORD, strlen(KEYWORD_PASSWORD))) {
+		else if (!strncasecmp(dbarg, KEYWORD_PASSWORD, strlen(KEYWORD_PASSWORD))) {
 			data->password = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_DBNAME, strlen(KEYWORD_DBNAME))) {
+		else if (!strncasecmp(dbarg, KEYWORD_DBNAME, strlen(KEYWORD_DBNAME))) {
 			data->dbname = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_SENSORNAME,
+		else if (!strncasecmp(dbarg, KEYWORD_SENSORNAME,
 				strlen(KEYWORD_SENSORNAME))) {
 			data->sensor_name = a1;
 		}
-		if (!strncasecmp(dbarg, KEYWORD_ENCODING, strlen(KEYWORD_ENCODING))) {
+		else if (!strncasecmp(dbarg, KEYWORD_ENCODING, strlen(KEYWORD_ENCODING))) {
 			if (!strncasecmp(a1, KEYWORD_ENCODING_HEX,
 					strlen(KEYWORD_ENCODING_HEX))) {
 				data->encoding = ENCODING_HEX;
@@ -1187,7 +1229,7 @@ void ParseDatabaseArgs(DatabaseData *data) {
 				FatalError("database unknown  (%s)", a1);
 			}
 		}
-		if (!strncasecmp(dbarg, KEYWORD_DETAIL, strlen(KEYWORD_DETAIL))) {
+		else if (!strncasecmp(dbarg, KEYWORD_DETAIL, strlen(KEYWORD_DETAIL))) {
 			if (!strncasecmp(a1, KEYWORD_DETAIL_FULL,
 					strlen(KEYWORD_DETAIL_FULL))) {
 				data->detail = DETAIL_FULL;
@@ -1198,7 +1240,7 @@ void ParseDatabaseArgs(DatabaseData *data) {
 				FatalError("database unknown detail level (%s)", a1);
 			}
 		}
-		if (!strncasecmp(dbarg, KEYWORD_IGNOREBPF, strlen(KEYWORD_IGNOREBPF))) {
+		else if (!strncasecmp(dbarg, KEYWORD_IGNOREBPF, strlen(KEYWORD_IGNOREBPF))) {
 			if (!strncasecmp(a1, KEYWORD_IGNOREBPF_NO,
 					strlen(KEYWORD_IGNOREBPF_NO))
 					|| !strncasecmp(a1, KEYWORD_IGNOREBPF_ZERO,
@@ -1214,7 +1256,7 @@ void ParseDatabaseArgs(DatabaseData *data) {
 			}
 
 		}
-		if (!strncasecmp(dbarg, KEYWORD_CONNECTION_LIMIT,
+		else if (!strncasecmp(dbarg, KEYWORD_CONNECTION_LIMIT,
 				strlen(KEYWORD_CONNECTION_LIMIT))) {
 			data->dbRH[data->dbtype_id].dbConnectionLimit = strtoul(a1, NULL,
 					10);
@@ -1225,12 +1267,12 @@ void ParseDatabaseArgs(DatabaseData *data) {
 					data->dbRH[data->dbtype_id].dbConnectionLimit;
 
 		}
-		if (!strncasecmp(dbarg, KEYWORD_RECONNECT_SLEEP_TIME,
+		else if (!strncasecmp(dbarg, KEYWORD_RECONNECT_SLEEP_TIME,
 				strlen(KEYWORD_RECONNECT_SLEEP_TIME))) {
 			data->dbRH[data->dbtype_id].dbReconnectSleepTime.tv_sec = strtoul(
 					a1, NULL, 10);
 		}
-		if (!strncasecmp(dbarg, KEYWORD_DISABLE_SIGREFTABLE,
+		else if (!strncasecmp(dbarg, KEYWORD_DISABLE_SIGREFTABLE,
 				strlen(KEYWORD_DISABLE_SIGREFTABLE))) {
 			data->dbRH[data->dbtype_id].disablesigref = 1;
 		}
@@ -1240,31 +1282,41 @@ void ParseDatabaseArgs(DatabaseData *data) {
 
 		/* the if/elseif check order is important because the keywords for the */
 		/* ca and ca_path are very similar */
-		if (!strncasecmp(dbarg, KEYWORD_SSL_KEY, strlen(KEYWORD_SSL_KEY))) {
+		else if (!strncasecmp(dbarg, KEYWORD_SSL_KEY, strlen(KEYWORD_SSL_KEY))) {
 			data->dbRH[DB_MYSQL].ssl_key = a1;
 			data->use_ssl = 1;
-		} else if (!strncasecmp(dbarg, KEYWORD_SSL_CERT,
+		}
+		else if (!strncasecmp(dbarg, KEYWORD_SSL_CERT,
 				strlen(KEYWORD_SSL_CERT))) {
 			data->dbRH[DB_MYSQL].ssl_cert = a1;
 			data->use_ssl = 1;
-		} else if (!strncasecmp(dbarg, KEYWORD_SSL_CA_PATH,
+		}
+		else if (!strncasecmp(dbarg, KEYWORD_SSL_CA_PATH,
 				strlen(KEYWORD_SSL_CA_PATH))) {
 			data->dbRH[DB_MYSQL].ssl_ca_path = a1;
 			data->use_ssl = 1;
-		} else if (!strncasecmp(dbarg, KEYWORD_SSL_CA,
+		}
+		else if (!strncasecmp(dbarg, KEYWORD_SSL_CA,
 				strlen(KEYWORD_SSL_CA))) {
 			data->dbRH[DB_MYSQL].ssl_ca = a1;
 			data->use_ssl = 1;
-		} else if (!strncasecmp(dbarg, KEYWORD_SSL_CIPHER,
+		}
+		else if (!strncasecmp(dbarg, KEYWORD_SSL_CIPHER,
 				strlen(KEYWORD_SSL_CIPHER))) {
 			data->dbRH[DB_MYSQL].ssl_key = a1;
 			data->use_ssl = 1;
-		} else if (!strncasecmp(dbarg, KEYWORD_MYSQL_RECONNECT,
+		}
+		else if (!strncasecmp(dbarg, KEYWORD_MYSQL_RECONNECT,
 				strlen(KEYWORD_MYSQL_RECONNECT))) {
 		    LogMessage("Set MYSQL reconnect OK\n");
 			data->dbRH[DB_MYSQL].mysql_reconnect = 1;
 		}
 #endif
+		else if (!strncasecmp(dbarg, "cpuset", 6)) {
+		    if ( 1 == sscanf(a1, "%lx", &data->cpuset_bm) ) {
+		        LogMessage("Set MYSQL query threads cpuset: 0x%lx\n", data->cpuset_bm);
+		    }
+		}
 
 #ifdef ENABLE_POSTGRESQL
 		if(!strncasecmp(dbarg, KEYWORD_SSL_MODE, strlen(KEYWORD_SSL_MODE)))
@@ -1356,55 +1408,47 @@ void ParseDatabaseArgs(DatabaseData *data) {
  **
  */
 u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
-		cacheSignatureObj *iUpdateSig)
+		cacheSignatureObj *iUpdateSig, uint8_t q_sock)
 {
 	u_int32_t db_sig_id = 0;
 	uint8_t isupdate = 0;
 
 	if ((data == NULL) || (iUpdateSig == NULL)) {
-		/* XXX */
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	DatabaseCleanInsert(data);
+//	DatabaseCleanSelect(data, q_sock);
+	DatabaseCleanInsert(data, q_sock);
 
-	if (SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+/*	if (SnortSnprintf(data->SQL_SELECT[q_sock], data->SQL_SELECT_SIZE,
 	SQL_SELECT_SPECIFIC_SIGNATURE, iUpdateSig->obj.sid, iUpdateSig->obj.gid,
 			iUpdateSig->obj.rev, iUpdateSig->obj.class_id,
 			iUpdateSig->obj.priority_id, iUpdateSig->obj.message)) {
-		/* XXX */
 		LogMessage(
 				"ERROR database: calling SnortSnprintf() on data->SQL_SELECT in [%s()] \n",
 				__FUNCTION__);
-
 		return 1;
-	}
+	}*/
 
 	if ( iUpdateSig->flag & CACHE_DATABASE ) {
 	    isupdate = 1;
-		if (SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+		if (SnortSnprintf(data->SQL_INSERT[q_sock], data->SQL_INSERT_SIZE,
 		SQL_UPDATE_SPECIFIC_SIGNATURE, iUpdateSig->obj.class_id,
 				iUpdateSig->obj.priority_id, iUpdateSig->obj.rev,
 				iUpdateSig->obj.db_id)) {
-			/* XXX */
-
 			LogMessage(
 					"ERROR database: calling SnortSnprintf() on data->SQL_INSERT in [%s()] \n",
 					__FUNCTION__);
-
 			return 1;
 		}
 	} else {
-		if (SnortSnprintf(data->SQL_INSERT, data->SQL_INSERT_SIZE,
+		if (SnortSnprintf(data->SQL_INSERT[q_sock], data->SQL_INSERT_SIZE,
 		SQL_INSERT_SIGNATURE, iUpdateSig->obj.sid, iUpdateSig->obj.gid,
 				iUpdateSig->obj.rev, iUpdateSig->obj.class_id,
 				iUpdateSig->obj.priority_id, iUpdateSig->obj.message)) {
-			/* XXX */
 			LogMessage(
 					"ERROR database: calling SnortSnprintf() on data->SQL_INSERT in [%s()] \n",
 					__FUNCTION__);
-
 			return 1;
 		}
 	}
@@ -1415,11 +1459,9 @@ u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
 					data->SQL_INSERT));
 #endif
 
-	if (Insert(data->SQL_INSERT, data, 1)) {
-		/* XXX */
+	if (Insert(data->SQL_INSERT[q_sock], data, 1, q_sock)) {
 		LogMessage("ERROR database: calling Insert() in [%s()] \n",
 				__FUNCTION__);
-
 		return 1;
 	}
 
@@ -1432,25 +1474,19 @@ u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
 	if (isupdate){
 	    db_sig_id = iUpdateSig->obj.db_id;
 	    LogMessage("%s: Last query(update) sig_id %d\n", __func__, db_sig_id);
+/*        if ( db_sig_id != iUpdateSig->obj.db_id ) {
+            LogMessage("ERROR database: Returned signature_id [%u] "
+                    "is not equal to updated signature_id [%u] in [%s()] \n",
+                    db_sig_id, iUpdateSig->obj.db_id, __FUNCTION__);
+            return 1;
+        }*/
 	}
 	else{
-	    db_sig_id = mysql_insert_id(data->m_sock);
+	    db_sig_id = mysql_insert_id(data->m_dbins[q_sock].m_sock);
 	    LogMessage("%s: Last query(insert) auto_increament id %d\n", __func__, db_sig_id);
-	}
 
-	if ( !(iUpdateSig->flag & CACHE_DATABASE) ) {
-		//iUpdateSig->flag ^= (CACHE_INTERNAL_ONLY | CACHE_BOTH);
-	    iUpdateSig->flag |= CACHE_DATABASE;
-		iUpdateSig->obj.db_id = db_sig_id;
-	}
-	else {//if ((iUpdateSig->flag & CACHE_BOTH)
-			//|| (iUpdateSig->flag & CACHE_DATABASE_ONLY)) {
-		if ( db_sig_id != iUpdateSig->obj.db_id ) {
-			LogMessage("ERROR database: Returned signature_id [%u] "
-			        "is not equal to updated signature_id [%u] in [%s()] \n",
-					db_sig_id, iUpdateSig->obj.db_id, __FUNCTION__);
-			return 1;
-		}
+        iUpdateSig->flag |= CACHE_DATABASE;
+        iUpdateSig->obj.db_id = db_sig_id;
 	}
 
 	return 0;
@@ -1458,10 +1494,12 @@ u_int32_t dbSignatureInformationUpdate(DatabaseData *data,
 
 /* NOTE: -elz this function need to be broken up.. */
 int dbProcessSignatureInformation(DatabaseData *data, void *event,
-		/*u_int32_t event_type, */u_int32_t *psig_id) {
+		/*u_int32_t event_type, */u_int32_t *psig_id, uint8_t q_sock) {
 	cacheSignatureObj unInitSig;
 	dbSignatureObj sigInsertObj = { 0 };
+	dbSignatureHashKey sigHashKey;
 	dbSignatureObj *psigObj;
+	cacheSignatureObj* pcacheSig;
 	u_int32_t i = 0;
 	u_int32_t db_classification_id = 0;
 	u_int32_t sigMatchCount = 0;
@@ -1471,10 +1509,10 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 	u_int32_t priority = 0;
 	u_int32_t classification = 0;
 	u_int32_t sigMsgLen = 0;
+	uint32_t ha_idx;
 	u_int8_t reuseSigMsg = 0;
 
 	if ((data == NULL) || (event == NULL) || (psig_id == NULL)) {
-		/* XXX */
 		return 1;
 	}
 
@@ -1484,6 +1522,10 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 	sid = ntohl(((Unified2EventCommon *) event)->signature_id);
 	gid = ntohl(((Unified2EventCommon *) event)->generator_id);
 	revision = ntohl(((Unified2EventCommon *) event)->signature_revision);
+	if ( 0 == revision ) {
+		LogMessage("%s: Invalid rev, set as default 1.\n", __func__);
+		revision = 1;  //Set Default as 1
+	}
 	priority = ntohl(((Unified2EventCommon *) event)->priority_id);
 	classification = ntohl(((Unified2EventCommon *) event)->classification_id);
 	/* NOTE: elz
@@ -1522,7 +1564,11 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 					sid));
 #endif
 
-	if ((sigMatchCount = cacheEventSignatureLookup(data->mc.cacheSignatureHead,
+	sigHashKey.gid = gid;
+	sigHashKey.sid = sid;
+	ha_idx = jhash(&sigHashKey, sizeof(sigHashKey), 0) & SIG_HASHSZ_MASK;
+
+	if ((sigMatchCount = cacheEventSignatureLookup(data->mc.cacheSigHashMap[ha_idx],//cacheSignatureHead
 			data->mc.plgSigCompare, gid, sid)) > 0) {
 		for (i = 0; i < sigMatchCount; i++) {
 			psigObj = &(data->mc.plgSigCompare[i].cacheSigObj->obj);
@@ -1562,7 +1608,9 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 
 	if (BcSidMapVersion() == SIDMAPV1) {
 
-		LogMessage("%s: sid_ver v1, db_id %d\n", __func__, unInitSig.obj.db_id);
+		LogMessage("%s: sid_ver v1, db_id %d, sid %d, gid %d, rev %d, class %d, prio_id %d\n", __func__,
+		        unInitSig.obj.db_id,
+		        sid, gid, revision, db_classification_id, priority);
 
 		if (unInitSig.obj.db_id != 0) {
 #if DEBUG
@@ -1583,7 +1631,7 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 			unInitSig.obj.class_id = db_classification_id;
 			unInitSig.obj.priority_id = priority;
 
-			if ((dbSignatureInformationUpdate(data, &unInitSig))) {
+			if ((dbSignatureInformationUpdate(data, &unInitSig, q_sock))) {
 				LogMessage(
 						"[%s()] Line[%u], call to dbSignatureInformationUpdate failed for : \n"
 								"[gid :%u] [sid: %u] [upd_rev: %u] [upd class: %u] [upd pri %u]\n",
@@ -1612,7 +1660,7 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 	sigInsertObj.class_id = db_classification_id;
 	sigInsertObj.priority_id = priority;
 
-	if (SignatureLookupDatabase(data, &sigInsertObj))
+	if (1)//SignatureLookupDatabase(data, &sigInsertObj, q_sock))
 	{
 		if (unInitSig.obj.sid != 0 && unInitSig.obj.gid != 0) {
 			sigMsgLen = strlen(unInitSig.obj.message);
@@ -1624,9 +1672,9 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 
 		if (reuseSigMsg) {
 			/* The signature was not found we will have to insert it */
-			LogMessage(
+/*			LogMessage(
 					"INFO [%s()]: [Event: %u] with [gid: %u] [sid: %u] [rev: %u] [classification: %u] [priority: %u] Signature Message -> \"[%s]\"\n"
-							"\t was not found in barnyard2 signature cache, this could mean its is the first time the signature is processed, and will be inserted\n"
+							"\t was not found in squirrel signature cache, this could mean its is the first time the signature is processed, and will be inserted\n"
 							"\t in the database with the above information, this message should only be printed once for each signature that is not  present in the database\n"
 							"\t The new inserted signature will not have its information present in the sig_reference table,it should be present on restart\n"
 							"\t if the information is present in the sid-msg.map file. \n"
@@ -1634,37 +1682,33 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 					__FUNCTION__,
 					ntohl(((Unified2EventCommon *) event)->event_id), gid, sid,
 					revision, db_classification_id, priority,
-					unInitSig.obj.message);
+					unInitSig.obj.message);*/
 
 			if (SnortSnprintf(sigInsertObj.message, SIG_MSG_LEN, "%s",
 					unInitSig.obj.message)) {
-				/* XXX */
 				return 1;
 			}
 		} else {
 			/* The signature does not exist we will have to insert it */
-			LogMessage(
+/*			LogMessage(
 					"INFO [%s()]: [Event: %u] with [gid: %u] [sid: %u] [rev: %u] [classification: %u] [priority: %u]\n"
-							"\t was not found in barnyard2 signature cache, this could lead to display inconsistency.\n"
+							"\t was not found in squirrel signature cache, this could lead to display inconsistency.\n"
 							"\t To prevent this warning, make sure that your sid-msg.map and gen-msg.map file are up to date with the snort process logging to the spool file.\n"
 							"\t The new inserted signature will not have its information present in the sig_reference table. \n"
 							"\t Note that the message inserted in the signature table will be snort default message \"Snort Alert [gid:sid:revision]\" \n"
 							"\t You can always update the message via a SQL query if you want it to be displayed correctly by your favorite interface\n\n",
 					__FUNCTION__,
 					ntohl(((Unified2EventCommon *) event)->event_id), gid, sid,
-					revision, db_classification_id, priority);
+					revision, db_classification_id, priority);*/
 
 			if (SnortSnprintf(sigInsertObj.message, SIG_MSG_LEN,
 					"Snort Alert [%u:%u:%u]", gid, sid, revision)) {
-				/* XXX */
 				return 1;
 			}
 		}
 
-		if ((SignatureCacheInsertObj(&sigInsertObj, &data->mc, 0))) {
-			/* XXX */
-			LogMessage(
-					"[%s()]: ERROR inserting object in the cache list .... \n",
+		if ( NULL == (pcacheSig=SignatureCacheInsertObj(&sigInsertObj, &data->mc, 0, ha_idx)) ) {
+			LogMessage("[%s()]: ERROR inserting object in the cache list .... \n",
 					__FUNCTION__);
 			goto func_err;
 		}
@@ -1676,30 +1720,33 @@ int dbProcessSignatureInformation(DatabaseData *data, void *event,
 		 * complete in just a few more jiffies, also its better this way
 		 * than to query the database everytime isin't.
 		 */
-		if (SignaturePopulateDatabase(data, data->mc.cacheSignatureHead, 1)) {
-			/* XXX */
+//		if (SignaturePopulateDatabase(data, data->mc.cacheSignatureHead, 1, q_sock)) {
+		if ((dbSignatureInformationUpdate(data, pcacheSig, q_sock))) {
 			LogMessage("[%s()]: ERROR inserting new signature \n",
 					__FUNCTION__);
 			goto func_err;
 		}
-	} else {
+	}
+/*	else {
 		LogMessage("%s: is in database\n", __func__);
-		if ((SignatureCacheInsertObj(&sigInsertObj, &data->mc, 1))) {
-			/* XXX */
-			LogMessage(
-					"[%s()]: ERROR inserting object in the cache list .... \n",
+		if ( NULL == (pcacheSig=SignatureCacheInsertObj(&sigInsertObj, &data->mc, 1)) ) {
+			LogMessage("[%s()]: ERROR inserting object in the cache list .... \n",
 					__FUNCTION__);
 			goto func_err;
 		}
-	}
+	}*/
 
 	/* Added for bugcheck */
-	assert(data->mc.cacheSignatureHead->obj.db_id != 0);
+/*	assert(data->mc.cacheSignatureHead->obj.db_id != 0);
+	*psig_id = data->mc.cacheSignatureHead->obj.db_id;*/
 
-	*psig_id = data->mc.cacheSignatureHead->obj.db_id;
+    assert(pcacheSig->obj.db_id != 0);
+    *psig_id = pcacheSig->obj.db_id;
+
 	return 0;
 
-	func_err: return 1;
+func_err:
+    return 1;
 }
 
 int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
@@ -1983,7 +2030,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 									//packet_data = fasthex(p->tcp_options[i].data, p->tcp_options[i].len);
 									if (fasthex_STATIC(p->tcp_options[i].data,
 											p->tcp_options[i].len,
-											data->PacketData)) {
+											data->PacketData[0])) {
 										/* XXX */
 										goto bad_query;
 									}
@@ -1991,7 +2038,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 									//packet_data = base64(p->tcp_options[i].data, p->tcp_options[i].len);
 									if (base64_STATIC(p->tcp_options[i].data,
 											p->tcp_options[i].len,
-											data->PacketData)) {
+											data->PacketData[0])) {
 										/* XXX */
 										goto bad_query;
 									}
@@ -2011,7 +2058,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 											p->tcp_options[i].code,
 											p->tcp_options[i].len,
 											//packet_data))  != SNORT_SNPRINTF_SUCCESS)
-											data->PacketData))
+											data->PacketData[0]))
 											!= SNORT_SNPRINTF_SUCCESS) {
 										goto bad_query;
 									}
@@ -2025,7 +2072,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 											p->tcp_options[i].code,
 											p->tcp_options[i].len,
 											//packet_data))  != SNORT_SNPRINTF_SUCCESS)
-											data->PacketData))
+											data->PacketData[0]))
 											!= SNORT_SNPRINTF_SUCCESS) {
 										goto bad_query;
 									}
@@ -2139,7 +2186,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 								//packet_data = fasthex(p->ip_options[i].data, p->ip_options[i].len);
 								if (fasthex_STATIC(p->ip_options[i].data,
 										p->ip_options[i].len,
-										data->PacketData)) {
+										data->PacketData[0])) {
 									/* XXX */
 									goto bad_query;
 								}
@@ -2147,7 +2194,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 								//packet_data = base64(p->ip_options[i].data, p->ip_options[i].len);
 								if (base64_STATIC(p->ip_options[i].data,
 										p->ip_options[i].len,
-										data->PacketData)) {
+										data->PacketData[0])) {
 									/* XXX */
 									goto bad_query;
 								}
@@ -2168,7 +2215,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 										p->ip_options[i].code,
 										p->ip_options[i].len,
 										//packet_data))  != SNORT_SNPRINTF_SUCCESS)
-										data->PacketData))
+										data->PacketData[0]))
 										!= SNORT_SNPRINTF_SUCCESS) {
 									goto bad_query;
 								}
@@ -2182,7 +2229,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 										p->ip_options[i].code,
 										p->ip_options[i].len,
 										//packet_data))  != SNORT_SNPRINTF_SUCCESS)
-										data->PacketData))
+										data->PacketData[0]))
 										!= SNORT_SNPRINTF_SUCCESS) {
 									goto bad_query;
 								}
@@ -2203,14 +2250,14 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 						if (data->encoding == ENCODING_BASE64) {
 							//packet_data_not_escaped = base64(p->data, p->dsize);
 							if (base64_STATIC(p->data, p->dsize,
-									data->PacketDataNotEscaped)) {
+									data->PacketDataNotEscaped[0])) {
 								/* XXX */
 								goto bad_query;
 							}
 						} else if (data->encoding == ENCODING_ASCII) {
 							//packet_data_not_escaped = ascii(p->data, p->dsize);
 							if (ascii_STATIC(p->data, p->dsize,
-									data->PacketDataNotEscaped)) {
+									data->PacketDataNotEscaped[0])) {
 								/* XXX */
 								goto bad_query;
 							}
@@ -2218,7 +2265,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 						} else {
 							//packet_data_not_escaped = fasthex(p->data, p->dsize);
 							if ((fasthex_STATIC(p->data, p->dsize,
-									data->PacketDataNotEscaped))) {
+									data->PacketDataNotEscaped[0]))) {
 								/* XXX */
 								goto bad_query;
 							}
@@ -2226,9 +2273,8 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 						}
 
 						//packet_data = snort_escape_string(packet_data_not_escaped, data);
-						if (snort_escape_string_STATIC(
-								data->PacketDataNotEscaped,
-								strlen(data->PacketDataNotEscaped) + 1, data)) {
+						if (snort_escape_string_STATIC(data->PacketDataNotEscaped[0], data->sanitize_buffer[0],
+								strlen(data->PacketDataNotEscaped[0]) + 1, data)) {
 							/* XXX */
 							goto bad_query;
 						}
@@ -2247,7 +2293,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 											"VALUES (%u,%u,:1);|%s", data->sid,
 									data->cid[0],
 									//packet_data_not_escaped))  != SNORT_SNPRINTF_SUCCESS)
-									data->PacketDataNotEscaped))
+									data->PacketDataNotEscaped[0]))
 									!= SNORT_SNPRINTF_SUCCESS) {
 								goto bad_query;
 							}
@@ -2260,7 +2306,7 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 											"VALUES (%u,%u,'%s');", data->sid,
 									data->cid[0],
 									//packet_data))  != SNORT_SNPRINTF_SUCCESS)
-									data->sanitize_buffer))
+									data->sanitize_buffer[0]))
 									!= SNORT_SNPRINTF_SUCCESS) {
 								goto bad_query;
 							}
@@ -2276,24 +2322,28 @@ int dbProcessEventInformation(DatabaseData *data, Packet *p, void *event,
 
 	bad_query:
 
-	setTransactionCallFail(&data->dbRH[data->dbtype_id]);
+	setTransactionCallFail(&data->m_dbins[SPO_DB_DEF_INS]);
 	return 1;
 
 }
 
-uint8_t dbProcessTspInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t q_ins)
+uint8_t dbProcessTspInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t ele_que_ins)
 {
+    char sl_separator;
     uint8_t rid;
     uint16_t i;
-    us_cid_t event_id;
+    uint16_t ins_cnt = 0;
     Packet *p;
+    SQLQueryEle *SQLQuery;
     char *SQLQueryPtr = NULL;
     char sl_buf[256];
-    char sl_separator;
+    us_cid_t event_id;
 
-    if ((SQLQueryPtr = SQL_GetNextQuery(data, q_ins)->string) == NULL) {
+    if ((SQLQuery = SQL_GetNextQuery(data, ele_que_ins)) == NULL) {
         return 1;
     }
+
+    SQLQueryPtr = SQLQuery->string;
 
     if ( !dbEventInfoFm_tsp(SQLQueryPtr, MAX_SQL_QUERY_LENGTH) )
         return 1;
@@ -2302,28 +2352,34 @@ uint8_t dbProcessTspInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t q_i
         if ( !dbEventInfoFm_tspdata(data, sl_buf, sizeof(sl_buf),
                 data->sid, rid, event_id, &(e_queue->ele[i]), sl_separator) )
             return 1;
-        data->cid[rid] = event_id;
+        ins_cnt++;
+        //data->cid[rid] = event_id;
     SQL_EVENT_FOR_EACH_END(SQLQueryPtr, sl_buf, MAX_SQL_QUERY_LENGTH)
-    strncat(SQLQueryPtr, ";", MAX_SQL_QUERY_LENGTH);
+
+    if ( 0 == ins_cnt )
+        SQLQuery->valid = 0;
+    else
+        strncat(SQLQueryPtr, ";", MAX_SQL_QUERY_LENGTH);
 
     return 0;
 //bad_query:
     return 1;
 }
 
-int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t q_ins)
+int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t ele_que_ins)
 {
 	Packet *p;
 	SQLPkt *ad_pkt;
 	char *SQLQueryPtr = NULL;
-	char *ProtoICMPPtr = NULL;
-	char *ProtoTCPtr = NULL;
-	char *ProtoUDPPtr = NULL;
+	SQLQueryEle *ProtoICMPPtr = NULL;
+	SQLQueryEle *ProtoTCPtr = NULL;
+	SQLQueryEle *ProtoUDPPtr = NULL;
 	SQLQueryEle *SQLQuery = NULL;
 	us_cid_t event_id;
 	uint8_t ret;
 	uint8_t rid;
 	uint16_t i;
+    uint16_t ins_cnt;
 	char sl_separator;
 	char sl_buf[256];
 	char *sl_buf_data;
@@ -2351,7 +2407,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	if ( 0 < e_queue->ele_exp_cnt ) {
 	    sl_buf_data = e_queue->ele_pktbuf;
 
-	    if ((SQLQuery = SQL_GetNextQueryAdData(data, q_ins)) == NULL) {
+	    if ((SQLQuery = SQL_GetNextQueryAdData(data, ele_que_ins)) == NULL) {
 	        LogMessage("%s: bad_query hmmm\n", __func__);
 	        goto bad_query;
 	    }
@@ -2367,7 +2423,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	        DEBUG_U_WRAP_DEEP(LogMessage("%s: ad_p event_id %d, ad_eid %d, r_data_len %d \n", __func__,
 	                data->ms_cid, ad_pkt->event_id, ad_pkt->u2raw_datalen));
 	        if ( !dbEventInfoFm_rawdata(data, sl_buf_data, SQL_PKT_BUF_LEN,/*sizeof(sl_buf_data),*/
-	                data->sid, rid, ad_pkt->event_id, ad_pkt, sl_separator) )
+	                data->sid, rid, ad_pkt->event_id, ad_pkt, sl_separator, ele_que_ins) )
 	            goto bad_query;
 	    SQL_ADP_FOR_EACH_END(SQLQuery, sl_buf_data, ad_pkt->u2raw_esc_len)
 	}
@@ -2380,7 +2436,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	}
 
 	/* Generate a default-formatted timestamp now */
-	dbProcessTspInfo(data, e_queue, q_ins);
+	dbProcessTspInfo(data, e_queue, ele_que_ins);
 
 /*	if (NULL == p)
 		return 0;
@@ -2404,11 +2460,11 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 
 		/*** Build a query for the ICMP Header ***/
 		if ( NULL == ProtoICMPPtr ) {
-			if ((ProtoICMPPtr = SQL_GetNextQuery(data, q_ins)->string) == NULL) {
+			if ((ProtoICMPPtr = SQL_GetNextQuery(data, ele_que_ins)) == NULL) {
 				goto bad_query;
 			}
 
-			if ( !dbEventInfoFm_icmp(ProtoICMPPtr, MAX_SQL_QUERY_LENGTH, data->detail) )
+			if ( !dbEventInfoFm_icmp(ProtoICMPPtr->string, MAX_SQL_QUERY_LENGTH, data->detail) )
 				goto bad_query;
 
 		    sl_separator = ' ';
@@ -2417,7 +2473,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	        sl_separator = ',';
 		}
 
-		SQLQueryPtr = ProtoICMPPtr;
+		SQLQueryPtr = ProtoICMPPtr->string;
 		if ( !dbEventInfoFm_icmpdata(sl_buf, sizeof(sl_buf),
 				data->sid, rid, event_id, p, sl_separator, data->detail) )
 			goto bad_query;
@@ -2433,11 +2489,11 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 
 		/*** Build a query for the TCP Header ***/
 		if ( NULL == ProtoTCPtr ) {
-			if ((ProtoTCPtr = SQL_GetNextQuery(data, q_ins)->string) == NULL) {
+			if ((ProtoTCPtr = SQL_GetNextQuery(data, ele_que_ins)) == NULL) {
 				goto bad_query;
 			}
 
-			if ( !dbEventInfoFm_tcp(ProtoTCPtr, MAX_SQL_QUERY_LENGTH, data->detail) )
+			if ( !dbEventInfoFm_tcp(ProtoTCPtr->string, MAX_SQL_QUERY_LENGTH, data->detail) )
 				goto bad_query;
 
 		    sl_separator = ' ';
@@ -2446,7 +2502,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
             sl_separator = ',';
         }
 
-		SQLQueryPtr = ProtoTCPtr;
+		SQLQueryPtr = ProtoTCPtr->string;
 		if ( !dbEventInfoFm_tcpdata(sl_buf, sizeof(sl_buf),
 				data->sid, rid, event_id, p, sl_separator, data->detail) )
 			goto bad_query;
@@ -2458,7 +2514,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 
 		/*** Build the query for TCP Options ***/
 		if ( NULL == SQLQuery ) {
-			if ( NULL == (SQLQuery=SQL_GetNextQuery(data, q_ins)) ) {
+			if ( NULL == (SQLQuery=SQL_GetNextQuery(data, ele_que_ins)) ) {
 				goto bad_query;
 			}
 
@@ -2476,7 +2532,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 		}
 
 		if ( !dbEventInfoFm_tcpoptdata(data, SQLQuery, MAX_SQL_QUERY_LENGTH,
-				data->sid, rid, event_id, p, sl_separator) )
+				data->sid, rid, event_id, p, sl_separator, ele_que_ins) )
 			goto bad_query;
 		break;
 	case IPPROTO_UDP:
@@ -2490,11 +2546,11 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 
 		/*** Build the query for the UDP Header ***/
 		if ( NULL == ProtoUDPPtr ) {
-			if ((ProtoUDPPtr = SQL_GetNextQuery(data, q_ins)->string) == NULL) {
+			if ((ProtoUDPPtr = SQL_GetNextQuery(data, ele_que_ins)) == NULL) {
 				goto bad_query;
 			}
 
-			if ( !dbEventInfoFm_udp(ProtoUDPPtr, MAX_SQL_QUERY_LENGTH, data->detail) )
+			if ( !dbEventInfoFm_udp(ProtoUDPPtr->string, MAX_SQL_QUERY_LENGTH, data->detail) )
 				goto bad_query;
 
 			sl_separator = ' ';
@@ -2503,7 +2559,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
             sl_separator = ',';
         }
 
-		SQLQueryPtr = ProtoUDPPtr;
+		SQLQueryPtr = ProtoUDPPtr->string;
 		if ( !dbEventInfoFm_udpdata(sl_buf, sizeof(sl_buf),
 				data->sid, rid, event_id, p, sl_separator, data->detail) )
 			goto bad_query;
@@ -2514,30 +2570,37 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	SQL_EVENT_FOR_EACH_PRO_END(SQLQueryPtr, sl_buf, MAX_SQL_QUERY_LENGTH)
 
 	if ( NULL != ProtoICMPPtr )
-	    strncat(ProtoICMPPtr, ";", MAX_SQL_QUERY_LENGTH);
+	    strncat(ProtoICMPPtr->string, ";", MAX_SQL_QUERY_LENGTH);
     if ( NULL != ProtoTCPtr )
-        strncat(ProtoTCPtr, ";", MAX_SQL_QUERY_LENGTH);
+        strncat(ProtoTCPtr->string, ";", MAX_SQL_QUERY_LENGTH);
     if ( NULL != ProtoUDPPtr )
-        strncat(ProtoUDPPtr, ";", MAX_SQL_QUERY_LENGTH);
+        strncat(ProtoUDPPtr->string, ";", MAX_SQL_QUERY_LENGTH);
     if ( NULL != SQLQuery ) {
         if ( SQLQuery->valid )
             strncat(SQLQuery->string, ";", MAX_SQL_QUERY_LENGTH);
     }
 
 	/*** Build the query for the IP Header ***/
-	if ((SQLQueryPtr = SQL_GetNextQuery(data, q_ins)->string) == NULL) {
+	if ((SQLQuery = SQL_GetNextQuery(data, ele_que_ins)) == NULL) {
 		goto bad_query;
 	}
 
+	SQLQueryPtr = SQLQuery->string;
 	if ( !dbEventInfoFm_ip(SQLQueryPtr, MAX_SQL_QUERY_LENGTH, data->detail) )
 		goto bad_query;
 
+	ins_cnt = 0;
 	SQL_EVENT_FOR_EACH(e_queue, i, p, rid)
 		if ( !dbEventInfoFm_ipdata(sl_buf, sizeof(sl_buf),
 				data->sid, rid, event_id, p, sl_separator, data->detail) )
 			goto bad_query;
+	    ins_cnt++;
 	SQL_EVENT_FOR_EACH_END(SQLQueryPtr, sl_buf, MAX_SQL_QUERY_LENGTH)
-	strncat(SQLQueryPtr, ";", MAX_SQL_QUERY_LENGTH);
+
+    if ( 0 == ins_cnt )
+        SQLQuery->valid = 0;
+    else
+        strncat(SQLQueryPtr, ";", MAX_SQL_QUERY_LENGTH);
 
 	/*** If is detailed ***/
 	if (!data->detail) {
@@ -2546,7 +2609,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	}
 
 	/*** Build querys for the IP Options ***/
-	if ( NULL == (SQLQuery=SQL_GetNextQuery(data, q_ins)) ) {
+	if ( NULL == (SQLQuery=SQL_GetNextQuery(data, ele_que_ins)) ) {
 		goto bad_query;
 	}
 
@@ -2557,7 +2620,7 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 
 	SQL_EVENT_FOR_EACH(e_queue, i, p, rid)
 		if ( !dbEventInfoFm_ipoptdata(data, SQLQuery, MAX_SQL_QUERY_LENGTH,
-				data->sid, rid, event_id, p, sl_separator) )
+				data->sid, rid, event_id, p, sl_separator, ele_que_ins) )
 			goto bad_query;
 	SQL_EVENT_FOR_EC_END(SQLQuery->valid)
 	strncat(SQLQuery->string, ";", MAX_SQL_QUERY_LENGTH);
@@ -2583,125 +2646,187 @@ int dbProcessMultiEventInfo(DatabaseData *data, SQLEventQueue *e_queue, uint8_t 
 	return 1;
 
 bad_query:
-    LogMessage("%s: bad_query\n", __func__);
-    setTransactionCallFail(&data->dbRH[data->dbtype_id]);
+    LogMessage("%s: bad_query, ele_queue %d\n", __func__, ele_que_ins);
+//    setTransactionCallFail(&data->m_dbins[SPO_DB_DEF_INS]);
     return 0;
 }
 
+int Spo_ProcQuery_QinsCheckAll(DatabaseData *spo_data)
+{
+    int ret;
+
+    pthread_mutex_lock(&spo_data->lquery_lock);
+    if ( spo_data->sql_q_bitmap ) {
+        ret = 1;
+    }
+    else {
+        ret = 0;
+    }
+    pthread_mutex_unlock(&spo_data->lquery_lock);
+
+    return ret;
+}
+
+int Spo_ProcQuery_GetQins(DatabaseData *spo_data, const uint8_t ins_base)
+{
+    uint8_t i, q_ins_bit;
+    int q_ins = -1;
+
+    pthread_mutex_lock(&spo_data->lquery_lock);
+/*    DEBUG_U_WRAP_SP_QUERY(LogMessage("%s: bitmap 0x%x, base queue [%d]\n",
+            __func__, spo_data->sql_q_bitmap, ins_base));*/
+    for ( i=0; i<SQL_ELEQUE_INS_MAX; i++ ) {
+        q_ins_bit = (ins_base+i) & (SQL_ELEQUE_INS_MAX-1);
+        if ( !(spo_data->sql_q_bitmap & (0x01<<q_ins_bit)) ) {
+            q_ins = q_ins_bit;
+            spo_data->sql_q_bitmap |= (0x01<<q_ins_bit);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&spo_data->lquery_lock);
+
+    return q_ins;
+}
+
+void Spo_ProcQuery_PutQins(DatabaseData *spo_data, uint8_t q_ins)
+{
+    pthread_mutex_lock(&spo_data->lquery_lock);
+    spo_data->sql_q_bitmap &= ~(0x01<<q_ins);
+    pthread_mutex_unlock(&spo_data->lquery_lock);
+}
+
+#ifdef IF_SPO_QUERY_IN_THREAD
 void *Spo_ProcQuery(void *arg)
+#else
+void Spo_ProcQuery(void *arg)
+#endif
 {
     uint8_t q_retry;
-    uint8_t q_ins = 0;
+    uint8_t ele_que_ins = 0, lQ_ins;
     char c;
     uint16_t i;
     u_int32_t sig_id;
-    int n;
+    int n;//, ret;
     int qe2qr_r, qr2qe_w;
     lquery_state lq_stat;
     u_int32_t itr = 0;
     u_int32_t SQLMaxQuery = 0;
     SQLQueryEle *CurrentQuery = NULL;
-    DatabaseData *spo_data = (DatabaseData*)arg;
+    DatabaseIns *lDB_ins = (DatabaseIns*)arg;
+    DatabaseData *spo_data = (DatabaseData*)lDB_ins->spo_data;
+    SQLEventQueue *lQ_queue;
+    SQLEvent *lQ_ele;
+    us_cid_t tsp_up_cid[BY_MUL_TR_DEFAULT];
+/*    struct timespec t_elapse;
 
-    while ( 1 ) //spo_data->lquery_ins[q_ins].ql_switch
+    t_elapse.tv_sec = 0;
+    t_elapse.tv_nsec = 10;*/
+    lQ_ins = lDB_ins->q_sock_idx;
+    ele_que_ins = lQ_ins;
+    lQ_queue = spo_db_event_queue[ele_que_ins];
+
+    //Proceed
+    qe2qr_r = spo_data->lEleQue_ins[ele_que_ins].pipe_queue2query[0];
+    qr2qe_w = spo_data->lEleQue_ins[ele_que_ins].pipe_query2queue[1];
+
+#ifdef IF_SPO_QUERY_IN_THREAD
+    while ( 1 ) //spo_data->lquery_ins[ele_que_ins].ql_switch
+#endif
     {
-        qe2qr_r = spo_data->lquery_ins[q_ins].pipe_queue2query[0];
-        qr2qe_w = spo_data->lquery_ins[q_ins].pipe_query2queue[1];
+        //Get ele_que_ins first
+/*        DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: GetNextQins, base queue [%d]\n", __func__, lQ_ins, ele_que_ins));
+        if ( (ret=Spo_ProcQuery_GetQins(spo_data, ele_que_ins)) < 0 ) {
+            DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: sleep in queue [%d]\n", __func__, lQ_ins, ele_que_ins));
+            nanosleep(&t_elapse, NULL);
+            continue;
+        }
+        ele_que_ins = (uint8_t)ret;*/
 
-        DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: wait\n", __func__, q_ins));
+        DEBUG_U_WRAP_DEEP(LogMessage("%s_%d: wait [%d]\n", __func__, lQ_ins, ele_que_ins));
 
         /* wait action from queue */
         do {
-            DEBUG_U_WRAP_DEEP(LogMessage("%s: waiting query [%d]\n", __func__, q_ins));
+            DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: waiting queue[%d]\n", __func__, lQ_ins, ele_que_ins));
             n = read(qe2qr_r, &c, 1);
         } while (n < 0 && errno == EINTR);
         if (n <= 0) {
-            LogMessage("%s: read_queue2query[%d] failed", __func__, q_ins);
+            LogMessage("%s: read_queue2query[%d] failed", __func__, ele_que_ins);
             perror("cannot read on queue2query pipe\n");
-            q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
+            /*Spo_ProcQuery_PutQins(spo_data, ele_que_ins);
+            ele_que_ins = SQL_ELEQUE_INS_PLUS_ONE(ele_que_ins);*/
+#ifdef IF_SPO_QUERY_IN_THREAD
             continue;
+#else
+            return;
+#endif
         }
 
         if ( 0 == c ) {
-            DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: read from queue: empty\n", __func__, q_ins));
-            q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
+            DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: read from queue[%d]: empty\n", __func__, lQ_ins, ele_que_ins));
+            /*Spo_ProcQuery_PutQins(spo_data, ele_que_ins);
+            ele_que_ins = SQL_ELEQUE_INS_PLUS_ONE(ele_que_ins);*/
+#ifdef IF_SPO_QUERY_IN_THREAD
             continue;
+#else
+            return;
+#endif
         }
 
-        lq_stat = spo_data->lquery_ins[q_ins].lq_stat;
-        DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: queue stat: %d\n", __func__, q_ins, lq_stat));
+        lq_stat = spo_data->lEleQue_ins[ele_que_ins].lq_stat;
+        DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: queue[%d] stat: %d\n", __func__, lQ_ins, ele_que_ins, lq_stat));
 
         switch ( lq_stat ) {
         case LQ_PRE_SIG_ID:
             {
                 //Check and fix sig_id
-                for (i=0; i<spo_db_event_queue[q_ins]->ele_cnt; i++) {
+                DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: ele_cnt %d, ele_exp_cnt %d\n", __func__, lQ_ins,
+                        lQ_queue->ele_cnt, lQ_queue->ele_exp_cnt));
+                memset(tsp_up_cid, 0, sizeof(tsp_up_cid));
+                pthread_mutex_lock(&spo_data->lsiginfo_lock);
+                for (i=0; i<lQ_queue->ele_cnt; i++) {
+                    lQ_ele = &(lQ_queue->ele[i]);
                     if (dbProcessSignatureInformation(spo_data,
-                            spo_db_event_queue[q_ins]->ele[i].event, &sig_id)) {
-                        setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                            lQ_ele->event, &sig_id, lQ_ins)) {
+                        setTransactionCallFail(&spo_data->m_dbins[lQ_ins]);
                         FatalError("[dbProcessSignatureInformation()]: Failed, stopping processing \n");
                     }
-                    spo_db_event_queue[q_ins]->ele[i].i_sig_id = sig_id;
+                    lQ_ele->i_sig_id = sig_id;
+                    tsp_up_cid[lQ_ele->rid] = lQ_ele->event_id;
                 }
-                //dbProcessTspInfo(spo_data, spo_db_event_queue[q_ins], q_ins);
+                for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
+                    if ( tsp_up_cid[i] > spo_data->cid[i] ) {
+                        DEBUG_U_WRAP_SP_QUERY(LogMessage("%s, queue: %d, update cid[%d]: %d\n", __func__,
+                                ele_que_ins, i, tsp_up_cid[i]));
+                        spo_data->cid[i] = tsp_up_cid[i];
+                    }
+                }
+                pthread_mutex_unlock(&spo_data->lsiginfo_lock);
 
                 /* send ack to queue */
                 n = 0;
                 while (n == 0 || (n < 0 && errno == EINTR)) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s: write2queue [%d] \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: write2queue [%d] sig_id\n", __func__, lQ_ins, ele_que_ins));
                     n = write(qr2qe_w, &c, 1);
                 }
                 if (n < 0) {
-                    LogMessage("%s: write2queue[%d] failed", __func__, q_ins);
+                    LogMessage("%s: write2queue[%d] failed", __func__, ele_que_ins);
                     perror("cannot write on query2queue pipe\n");
                 }
 
-                q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
-                DEBUG_U_WRAP_DEEP(LogMessage("%s: sig_id done, process next query [%d]\n",
-                        __func__, q_ins));
+                /*Spo_ProcQuery_PutQins(spo_data, ele_que_ins);
+                ele_que_ins = SQL_ELEQUE_INS_PLUS_ONE(ele_que_ins);*/
+                DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: sig_id done, process next queue [%d]\n",
+                        __func__, lQ_ins, ele_que_ins));
             }
             break;
         case LQ_TRANS_QUERY:
             {
-                /* Point where transaction rollback
-        TransacRollback:
-                if (checkTransactionState(&data->dbRH[data->dbtype_id])
-                        && checkTransactionCall(&data->dbRH[data->dbtype_id])) {
-                    if (RollbackTransaction(data)) {
-                        FatalError("database Unable to rollback transaction in [%s()]\n",
-                                __FUNCTION__);
-                    }
-                    resetTransactionState(&data->dbRH[data->dbtype_id]);
-                } */
-
-                /*
-                 * Check for invalid revision eg: rev==0 when people write their own testing signature and
-                 * do not set a revision, in our context we will not log it to the database
-                 * and print a informative message
-                 */
-            /*  sid = ntohl(((Unified2EventCommon *) event)->signature_id);
-                gid = ntohl(((Unified2EventCommon *) event)->generator_id);
-                revision = ntohl(((Unified2EventCommon *) event)->signature_revision);
-                event_id = ntohl(((Unified2EventCommon *) event)->event_id);
-                event_second = ntohl(((Unified2EventCommon *) event)->event_second);
-                event_microsecond = ntohl(
-                        ((Unified2EventCommon *) event)->event_microsecond);
-
-                if ((gid == 1) && (revision == 0)) {
-                    LogMessage(
-                            "INFO: Current event with event_id [%u] Event Second:Microsecond [%u:%u] and signature id of [%u] was logged with a revision of [%u]\n"
-                                    "      Make sure you verify your triggering  rule body so it include the snort keyword \"rev:xxx;\" Where xxx is greater than 0 \n"
-                                    ">>>>>>The event has not been logged to the database<<<<<<\n",
-                            event_id, event_second, event_microsecond, sid, revision);
-                    return;
-                }*/
-
                 /* This has been refactored to simplify the workflow of the function
                  * We separate the legacy signature entry code and the event entry code
                  */
 
-                DEBUG_U_WRAP_DEEP(LogMessage("%s: BeginTransection [%d]\n", __func__, q_ins));
-                if (BeginTransaction(spo_data)) {
+                DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: BeginTransection [%d]\n", __func__, lQ_ins, ele_que_ins));
+                if (BeginTransaction(spo_data, lQ_ins)) {
                     FatalError("database [%s()]: Failed to Initialize transaction, bailing ... \n",
                             __FUNCTION__);
                 }
@@ -2709,10 +2834,10 @@ void *Spo_ProcQuery(void *arg)
 #define Q_RETRY_TIME		64
 
                 //Event
-                if ((SQLMaxQuery = SQL_GetMaxQuery(spo_data, q_ins))) {
+                if ((SQLMaxQuery = SQL_GetMaxQuery(spo_data, ele_que_ins))) {
                     itr = 0;
                     for (itr = 0; itr < SQLMaxQuery; itr++) {
-                        if ((CurrentQuery = SQL_GetQueryByPos(spo_data, q_ins, itr)) == NULL) {
+                        if ((CurrentQuery = SQL_GetQueryByPos(spo_data, ele_que_ins, itr)) == NULL) {
                             goto bad_query;
                         }
 
@@ -2722,20 +2847,20 @@ void *Spo_ProcQuery(void *arg)
                         DEBUG_U_WRAP_DEEP(LogMessage("%s: insert query %d, %s\n", __func__, itr, CurrentQuery->string));
 
                         q_retry = Q_RETRY_TIME;
-                        while ( Insert(CurrentQuery->string, spo_data, 1) ) {
+                        while ( Insert(CurrentQuery->string, spo_data, 1, lQ_ins) ) {
                             ErrorMessage("[%s()]: Insertion of Query [%s] failed\n",
                                     __FUNCTION__, CurrentQuery->string);
 
                             if ( (Q_RETRY_TIME>>1) == q_retry ) {
                                 sleep(1);
-                                CommitTransaction(spo_data);
-                                Disconnect(spo_data);
+                                CommitTransaction(spo_data, lQ_ins);
+                                Disconnect(spo_data, lQ_ins);
                                 sleep(1);
-                                Connect(spo_data);
-                                BeginTransaction(spo_data);
+                                Connect(spo_data, lQ_ins);
+                                BeginTransaction(spo_data, lQ_ins);
                             }
                             else if ( 0 == q_retry ) {
-                                setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                                setTransactionCallFail(&spo_data->m_dbins[lQ_ins]);
                                 goto bad_query;
                             }
 
@@ -2746,10 +2871,10 @@ void *Spo_ProcQuery(void *arg)
                 }
 
                 //Event Packet
-                if ((SQLMaxQuery = SQL_GetMaxQueryData(spo_data, q_ins))) {
+                if ((SQLMaxQuery = SQL_GetMaxQueryData(spo_data, ele_que_ins))) {
                     itr = 0;
                     for (itr = 0; itr < SQLMaxQuery; itr++) {
-                        if ((CurrentQuery = SQL_GetQueryDataByPos(spo_data, q_ins, itr)) == NULL) {
+                        if ((CurrentQuery = SQL_GetQueryDataByPos(spo_data, ele_que_ins, itr)) == NULL) {
                             goto bad_query;
                         }
 
@@ -2759,20 +2884,20 @@ void *Spo_ProcQuery(void *arg)
                         DEBUG_U_WRAP_DEEP(LogMessage("%s: insert query data %d\n", __func__, itr));
 
                         q_retry = Q_RETRY_TIME;
-                        while ( Insert(CurrentQuery->string, spo_data, 1) ) {
+                        while ( Insert(CurrentQuery->string, spo_data, 1, lQ_ins) ) {
                             ErrorMessage("[%s()]: Insertion of Query [%s] failed\n",
                                     __FUNCTION__, CurrentQuery->string);
 
                             if ( (Q_RETRY_TIME>>1) == q_retry ) {
                                 sleep(1);
-                                CommitTransaction(spo_data);
-                                Disconnect(spo_data);
+                                CommitTransaction(spo_data, lQ_ins);
+                                Disconnect(spo_data, lQ_ins);
                                 sleep(1);
-                                Connect(spo_data);
-                                BeginTransaction(spo_data);
+                                Connect(spo_data, lQ_ins);
+                                BeginTransaction(spo_data, lQ_ins);
                             }
                             else if ( 0 == q_retry ) {
-                                setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                                setTransactionCallFail(&spo_data->m_dbins[lQ_ins]);
                                 goto bad_query;
                             }
 
@@ -2783,10 +2908,10 @@ void *Spo_ProcQuery(void *arg)
                 }
 
                 //Addtional Packet
-                if ((SQLMaxQuery = SQL_GetMaxQueryAdData(spo_data, q_ins))) {
+                if ((SQLMaxQuery = SQL_GetMaxQueryAdData(spo_data, ele_que_ins))) {
                     itr = 0;
                     for (itr = 0; itr < SQLMaxQuery; itr++) {
-                        if ((CurrentQuery = SQL_GetQueryAdDataByPos(spo_data, q_ins, itr)) == NULL) {
+                        if ((CurrentQuery = SQL_GetQueryAdDataByPos(spo_data, ele_que_ins, itr)) == NULL) {
                             goto bad_query;
                         }
 
@@ -2796,20 +2921,20 @@ void *Spo_ProcQuery(void *arg)
                         DEBUG_U_WRAP_DEEP(LogMessage("%s: insert query Addtional data %d\n", __func__, itr));
 
                         q_retry = Q_RETRY_TIME;
-                        while ( Insert_real(CurrentQuery->string, CurrentQuery->slen, spo_data, 1) ) {
+                        while ( Insert_real(CurrentQuery->string, CurrentQuery->slen, spo_data, 1, lQ_ins) ) {
                             ErrorMessage("[%s()]: Insertion of Query [%s] failed\n",
                                     __FUNCTION__, CurrentQuery->string);
 
                             if ( (Q_RETRY_TIME>>1) == q_retry ) {
                                 sleep(1);
-                                CommitTransaction(spo_data);
-                                Disconnect(spo_data);
+                                CommitTransaction(spo_data, lQ_ins);
+                                Disconnect(spo_data, lQ_ins);
                                 sleep(1);
-                                Connect(spo_data);
-                                BeginTransaction(spo_data);
+                                Connect(spo_data, lQ_ins);
+                                BeginTransaction(spo_data, lQ_ins);
                             }
                             else if ( 0 == q_retry ) {
-                                setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                                setTransactionCallFail(&spo_data->m_dbins[lQ_ins]);
                                 goto bad_query;
                             }
 
@@ -2820,44 +2945,46 @@ void *Spo_ProcQuery(void *arg)
                 }
 
                 if ( spo_data->refresh_mcid ) {
-                    UpdateLastCid(spo_data, 0, 0);
+                    UpdateLastCid(spo_data, 0, 0, lQ_ins);
                     spo_data->refresh_mcid = 0;
                 }
 
-                if (CommitTransaction(spo_data)) {
+                if (CommitTransaction(spo_data, lQ_ins)) {
                     ErrorMessage("ERROR database: [%s()]: Error commiting transaction \n",
                             __FUNCTION__);
-                    setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                    setTransactionCallFail(&spo_data->m_dbins[lQ_ins]);
                     goto bad_query;
                 } else {
-                    resetTransactionState(&spo_data->dbRH[spo_data->dbtype_id]);
+                    resetTransactionState(&spo_data->m_dbins[lQ_ins]);
                 }
 
-                DEBUG_U_WRAP_DEEP(LogMessage("%s: CommitTransaction [%d]\n", __func__, q_ins));
+                DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: CommitTransaction [%d]\n", __func__, lQ_ins, ele_que_ins));
                 /* Clean the query */
-                SQL_Cleanup(spo_data, q_ins);
+                SQL_Cleanup(spo_data, ele_que_ins);
 
                 /* send ack to queue */
                 n = 0;
                 while (n == 0 || (n < 0 && errno == EINTR)) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s: write2queue [%d], transaction \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: write2queue [%d], transaction \n", __func__, lQ_ins, ele_que_ins));
                     n = write(qr2qe_w, &c, 1);
                 }
                 if (n < 0) {
-                    LogMessage("%s: write2queue[%d] failed, transaction", __func__, q_ins);
+                    LogMessage("%s: write2queue[%d] failed, transaction", __func__, ele_que_ins);
                     perror("cannot write on query2queue pipe\n");
                 }
 
-                q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
-                DEBUG_U_WRAP_DEEP(LogMessage("%s: query done, process next query [%d]\n",
-                        __func__, q_ins));
+                /*Spo_ProcQuery_PutQins(spo_data, ele_que_ins);
+                ele_que_ins = SQL_ELEQUE_INS_PLUS_ONE(ele_que_ins);*/
+                DEBUG_U_WRAP_SP_QUERY(LogMessage("%s_%d: query done, process next queue [%d]\n",
+                        __func__, lQ_ins, ele_que_ins));
             }
             break;
         case LQ_EXIT:
             {
-                q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
+                /*Spo_ProcQuery_PutQins(spo_data, ele_que_ins);
+                ele_que_ins = SQL_ELEQUE_INS_PLUS_ONE(ele_que_ins);*/
                 LogMessage("%s: queue exit, process next query [%d]\n",
-                        __func__, q_ins);
+                        __func__, ele_que_ins);
             }
             break;
         default:
@@ -2865,25 +2992,32 @@ void *Spo_ProcQuery(void *arg)
         }
     }
 
-    LogMessage("%s: exiting on [%d]\n", __func__, q_ins);
-
+#ifdef IF_SPO_QUERY_IN_THREAD
+    LogMessage("%s: exiting on [%d]\n", __func__, ele_que_ins);
     return NULL;
+#else
+    return;
+#endif
 
 bad_query:
 /*    if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
         goto TransacRollback;
     } */
-    if (checkTransactionState(&spo_data->dbRH[spo_data->dbtype_id])
-            && checkTransactionCall(&spo_data->dbRH[spo_data->dbtype_id])) {
-        if (RollbackTransaction(spo_data)) {
+    if (checkTransactionState(&spo_data->m_dbins[lQ_ins])
+            && checkTransactionCall(&spo_data->m_dbins[lQ_ins])) {
+        if (RollbackTransaction(spo_data, lQ_ins)) {
             FatalError("database Unable to rollback transaction in [%s()]\n",
                     __FUNCTION__);
         }
-        resetTransactionState(&spo_data->dbRH[spo_data->dbtype_id]);
+        resetTransactionState(&spo_data->m_dbins[lQ_ins]);
     }
     FatalError("database bad_query in [%s()]\n", __FUNCTION__);
 
+#ifdef IF_SPO_QUERY_IN_THREAD
     return NULL;
+#else
+    return;
+#endif
 }
 
 void *Spo_EncodeSql(void * arg)
@@ -2909,7 +3043,7 @@ void *Spo_EncodeSql(void * arg)
             {
                 DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: wait event data\n", __func__, q_ins));
                 do {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: waiting queue \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: waiting queue \n", __func__, q_ins));
                     n = read(da2qe_r, &c, 1);
                 } while (n < 0 && errno == EINTR);
                 if (n <= 0) {
@@ -2924,17 +3058,21 @@ void *Spo_EncodeSql(void * arg)
                     n = write(qe2qr_w, &c, 1);
 
                     LogMessage("%s[%d]: exiting \n", __func__, q_ins);
+                    dbEventQueueClean(q_ins);
                     n = write(qe2da_w, &c, 1);
+                    Spo_ProcQuery_PutQins(spo_data, q_ins);
                     goto enc_endloop;
                 }
 
                 if ( 0 == c ) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: read from data: empty\n", __func__, q_ins, c));
-                    n = write(qe2qr_w, &c, 1);
-                    n = write(qe2qr_w, &c, 1);
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: read from data: empty\n", __func__, q_ins, c));
+                    //n = write(qe2qr_w, &c, 1);
+                    //n = write(qe2qr_w, &c, 1);
 
                     //write back to data
-                    n = write(qe2da_w, &c, 1);
+                    dbEventQueueClean(q_ins);
+                    //n = write(qe2da_w, &c, 1);
+                    Spo_ProcQuery_PutQins(spo_data, q_ins);
                     break;
                 }
 
@@ -2943,8 +3081,14 @@ void *Spo_EncodeSql(void * arg)
                 /* send to query for sig_id; */
                 n = 0;
                 while (n == 0 || (n < 0 && errno == EINTR)) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: write2query \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: write2query for sig_id\n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: ele_cnt %d, ele_exp_cnt %d\n", __func__, q_ins,
+                            spo_db_event_queue[q_ins]->ele_cnt, spo_db_event_queue[q_ins]->ele_exp_cnt));
                     n = write(qe2qr_w, &c, 1);
+
+#ifndef IF_SPO_QUERY_IN_THREAD
+                    Spo_ProcQuery((void*)(&spo_data->m_dbins[q_ins]));
+#endif
                 }
                 if (n < 0) {
                     LogMessage("%s[%d]: write2query failed", __func__, q_ins);
@@ -2952,7 +3096,9 @@ void *Spo_EncodeSql(void * arg)
 
                     //Drop this queue
                     lQ_ins->lq_stat = LQ_PRE_QUEUE;
-                    n = write(qe2da_w, &c, 1);
+                    dbEventQueueClean(q_ins);
+                    //n = write(qe2da_w, &c, 1);
+                    Spo_ProcQuery_PutQins(spo_data, q_ins);
                     break;
                 }
             }
@@ -2960,7 +3106,7 @@ void *Spo_EncodeSql(void * arg)
         case LQ_PRE_SIG_ID:
             {
                 do {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: waiting query \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: waiting query sig_id\n", __func__, q_ins));
                     n = read(qr2qe_r, &c, 1);
                 } while (n < 0 && errno == EINTR);
                 if (n <= 0) {
@@ -2969,10 +3115,10 @@ void *Spo_EncodeSql(void * arg)
                     break;
                 }
 
-                DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: preparing sql\n", __func__, q_ins));
+                DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: preparing sql\n", __func__, q_ins));
 
                 if ( !dbProcessMultiEventInfo(spo_data, spo_db_event_queue[q_ins], q_ins) ) {
-                    setTransactionCallFail(&spo_data->dbRH[spo_data->dbtype_id]);
+                    //setTransactionCallFail(&spo_data->m_dbins[SPO_DB_DEF_INS]);
                     FatalError("[dbProcessMultiEventInfo()]: Failed, stoping processing \n");
                 }
 
@@ -2981,8 +3127,12 @@ void *Spo_EncodeSql(void * arg)
                 /* send to query to start transaction with SQL*/
                 n = 0;
                 while (n == 0 || (n < 0 && errno == EINTR)) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: write2query \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: write2query \n", __func__, q_ins));
                     n = write(qe2qr_w, &c, 1);
+
+#ifndef IF_SPO_QUERY_IN_THREAD
+                    Spo_ProcQuery((void*)(&spo_data->m_dbins[q_ins]));
+#endif
                 }
                 if (n < 0) {
                     LogMessage("%s[%d]: write2query failed", __func__, q_ins);
@@ -2994,9 +3144,11 @@ void *Spo_EncodeSql(void * arg)
 
                 /* send to data to release queue*/
                 n = 0;
-                while (n == 0 || (n < 0 && errno == EINTR)) {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s: write2data [%d] \n", __func__, q_ins));
-                    n = write(qe2da_w, &c, 1);
+                {//while (n == 0 || (n < 0 && errno == EINTR)) {
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: write2data  \n", __func__, q_ins));
+                    dbEventQueueClean(q_ins);
+                    //n = write(qe2da_w, &c, 1);
+                    Spo_ProcQuery_PutQins(spo_data, q_ins);
                 }
                 if (n < 0) {
                     LogMessage("%s: write2data[%d] failed", __func__, q_ins);
@@ -3009,7 +3161,7 @@ void *Spo_EncodeSql(void * arg)
         case LQ_TRANS_QUERY:
             {
                 do {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: waiting query \n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: waiting query \n", __func__, q_ins));
                     n = read(qr2qe_r, &c, 1);
                 } while (n < 0 && errno == EINTR);
                 if (n <= 0) {
@@ -3018,7 +3170,7 @@ void *Spo_EncodeSql(void * arg)
                     break;
                 }
 
-                DEBUG_U_WRAP_DEEP(LogMessage("%s[%d]: finish query \n", __func__, q_ins));
+                DEBUG_U_WRAP_SP_ELEQUE(LogMessage("%s[%d]: finish query \n", __func__, q_ins));
                 lQ_ins->lq_stat = LQ_PRE_QUEUE;
             }
             break;
@@ -3048,20 +3200,24 @@ enc_endloop:
 void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
 {
     uint8_t rid;
-    uint8_t q_ins;
+    uint8_t q_ins, q_ins_next;
     char c;
     lflush_state q_flushout = LF_CUR;
     int i, n, n_qins = 0;
-    int da2qe_w, qe2da_r;
+    int da2qe_w;//, qe2da_r;
 	us_cid_t event_id;
     DatabaseData *data = (DatabaseData *) arg;
     Unified2Packet *pdata;
+    struct timespec t_elapse;
 
 	if ( NULL == data ) {
 		FatalError("database [%s()]: Called with a NULL DatabaseData Argument, can't process \n",
 				__FUNCTION__);
 		return;
 	}
+
+    t_elapse.tv_sec = 0;
+    t_elapse.tv_nsec = 10;
 
 	q_ins = data->enc_q_ins;
 
@@ -3072,6 +3228,14 @@ void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
                 rid = ((EventGMCid*)event)->rid;
                 ((EventGMCid*)event)->cid = data->cid[rid];
                 ((EventGMCid*)event)->ms_cid = data->ms_cid[rid];
+            }
+            return;
+        }
+        break;
+    case UNIFIED2_IDS_GET_ELEQUE_INS:
+        {
+            if ( NULL != event ) {
+                *((uint8_t*)event) = q_ins;
             }
             return;
         }
@@ -3099,15 +3263,15 @@ void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
         break;
     case UNIFIED2_IDS_SPO_EXIT:
         {
-            for (i=0; i<SQL_QUERY_INS_MAX; i++) {
+            for (i=0; i<SQL_ELEQUE_INS_MAX; i++) {
                 c = 1;
-                data->lquery_ins[q_ins].ql_switch = 0;
+                data->lEleQue_ins[q_ins].ql_switch = 0;
                 LogMessage("%s: write to exit [%d] \n", __func__, q_ins);
-                n = write(data->lquery_ins[q_ins].pipe_data2queue[1], &c, 1);
-                n = read(data->lquery_ins[q_ins].pipe_queue2data[0], &c, 1);
+                n = write(data->lEleQue_ins[q_ins].pipe_data2queue[1], &c, 1);
+                n = read(data->lEleQue_ins[q_ins].pipe_queue2data[0], &c, 1);
                 LogMessage("%s: queue exit OK [%d] \n", __func__, q_ins);
 
-                q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
+                q_ins = SQL_ELEQUE_INS_PLUS_ONE(q_ins);
             }
             return;
         }
@@ -3131,12 +3295,19 @@ void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
 	        if ( (0 == spo_db_event_queue[q_ins]->ele_cnt)
 	        		&&  (0 == spo_db_event_queue[q_ins]->ele_exp_cnt) ) {
 	            LogMessage( "%s: Event Queue is empty\n", __func__ );
+	            if ( NULL != event ) {
+	                ((RingTopOct*)event)->r_flag = 0;
+	            }
 	            return;
 	        }
 
 	        LogMessage("%s: flush event_queue[%d], proceed, %d, %d\n", __func__, q_ins,
 	                spo_db_event_queue[q_ins]->ele_cnt, spo_db_event_queue[q_ins]->ele_exp_cnt);
 	        q_flushout = LF_CUR;
+
+	        if ( NULL != event ) {
+	            spo_db_event_queue[q_ins]->ele_rtOct = (RingTopOct*)event;
+	        }
 	    }
 	    break;
 	default:
@@ -3173,9 +3344,10 @@ void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
 
 	        if ( spo_db_event_queue[q_ins]->ele_exp_cnt >= SQL_PKT_QUEUE_LEN
 	                || spo_db_event_queue[q_ins]->ele_cnt >= SQL_EVENT_QUEUE_LEN ) {
+	            //Shouldn't be, well controlled by Output process/thread.
 	            DEBUG_U_WRAP_DEEP(LogMessage("%s: event queue is full, proceed\n", __func__));
 	        }
-	        else{
+	        else {
 	            DEBUG_U_WRAP_DEEP(LogMessage("%s: save pkt into event queue\n", __func__));
 	            return;
 	        }
@@ -3183,60 +3355,96 @@ void Spo_Database(Packet *p, void *event, uint32_t event_type, void *arg)
 	    break;
 	}
 
-	for (i=q_ins; i<SQL_QUERY_INS_MAX; i++) {
-	    da2qe_w = data->lquery_ins[i].pipe_data2queue[1];
-	    if ( (i==q_ins) && (LF_SET==q_flushout || LF_CUR==q_flushout) ) {
+//	for (i=q_ins; i<SQL_ELEQUE_INS_MAX; i++) {
+	    da2qe_w = data->lEleQue_ins[q_ins].pipe_data2queue[1];
+	    if ( (LF_SET==q_flushout || LF_CUR==q_flushout) ) {
 	        n_qins = 0;
 	        c = 1;
 	        while (n_qins == 0 || (n_qins < 0 && errno == EINTR)) {
-	            DEBUG_U_WRAP_DEEP(LogMessage("%s: write2queue [%d] \n", __func__, q_ins));
+	            DEBUG_U_WRAP_SP_DB(LogMessage("%s: write2queue [%d], c=1, ele_cnt %d, ele_exp_cnt %d \n", __func__, q_ins,
+	                    spo_db_event_queue[q_ins]->ele_cnt, spo_db_event_queue[q_ins]->ele_exp_cnt));
 	            n_qins = write(da2qe_w, &c, 1);
 	        }
 	    }
-	    else if ( LF_SET==q_flushout || LF_SET_EMPTY==q_flushout ) {
+	    else if ( /*LF_SET==q_flushout ||*/ LF_SET_EMPTY==q_flushout ) {
 	        c = 0;
-	        DEBUG_U_WRAP_DEEP(LogMessage("%s: write2queue [%d], 0 \n", __func__, q_ins));
+	        DEBUG_U_WRAP_SP_DB(LogMessage("%s: write2queue [%d], c=0 \n", __func__, q_ins));
 	        n = write(da2qe_w, &c, 1);
 	    }
-	}
+//	}
 
-    for (i=q_ins; i<SQL_QUERY_INS_MAX; i++) {
-        qe2da_r = data->lquery_ins[i].pipe_queue2data[0];
+/*    for (i=q_ins; i<SQL_ELEQUE_INS_MAX; i++) {
+        qe2da_r = data->lEleQue_ins[i].pipe_queue2data[0];
         if ( (i==q_ins) && (LF_SET==q_flushout || LF_CUR==q_flushout) ) {
             if (n_qins <= 0) {
                 LogMessage("%s: write2queue[%d] failed", __func__, q_ins);
                 perror("cannot write to data2queue pipe\n");
             }
             else {
-                /* wait queue*/
+                // wait queue
                 do {
-                    DEBUG_U_WRAP_DEEP(LogMessage("%s: waiting ins [%d]\n", __func__, q_ins));
+                    DEBUG_U_WRAP_SP_DB(LogMessage("%s: waiting ins [%d]\n", __func__, q_ins));
                     n = read(qe2da_r, &c, 1);
                 } while ((n < 0) && (EINTR==errno) && (0==exit_signal));
                 if (n <= 0) {
                     LogMessage("%s: read queue2data[%d] failed", __func__, q_ins);
                     perror("cannot read from queue2data pipe\n");
                 }
-                /* wait queue ok */
+                // wait queue ok
 
                 //Step to next query instance.
-                data->enc_q_ins = SQL_QUERY_INS_PLUS_ONE(q_ins);
-                DEBUG_U_WRAP_DEEP(LogMessage("%s: process next ins [%d]\n", __func__, data->enc_q_ins));
+                data->enc_q_ins = SQL_ELEQUE_INS_PLUS_ONE(q_ins);
+                DEBUG_U_WRAP_SP_DB(LogMessage("%s: process next ins [%d]\n", __func__, data->enc_q_ins));
             }
         }
         else if ( LF_SET==q_flushout || LF_SET_EMPTY==q_flushout ) {
-            DEBUG_U_WRAP_DEEP(LogMessage("%s: waiting ins [%d], 0\n", __func__, q_ins));
+            DEBUG_U_WRAP_SP_DB(LogMessage("%s: waiting ins [%d], 0\n", __func__, i));
             n = read(qe2da_r, &c, 1);
         }
+    }*/
+
+    if ( LF_CUR == q_flushout ) {
+        if (n_qins <= 0) {
+            LogMessage("%s: write2queue[%d] failed\n", __func__, q_ins);
+            perror("cannot write to data2queue pipe\n");
+        }
+        else {
+            // wait queue
+
+            //Step to next query instance.
+            DEBUG_U_WRAP_SP_DB(LogMessage("%s: Step to next query, from ins [%d]\n", __func__, q_ins));
+            //data->enc_q_ins = Spo_ProcQuery_GetQins(data, 0);//SQL_ELEQUE_INS_PLUS_ONE(q_ins);
+            q_ins_next = SQL_ELEQUE_INS_PLUS_ONE(q_ins);
+            while ( (n=Spo_ProcQuery_GetQins(data, q_ins_next)) < 0 ) {
+                nanosleep(&t_elapse, NULL);
+            }
+            DEBUG_U_WRAP_SP_DB(LogMessage("%s: LF_CUR, process next ins [%d]\n", __func__, n));
+            data->enc_q_ins = (uint8_t)n;
+        }
+    }
+    else if ( LF_SET==q_flushout || LF_SET_EMPTY==q_flushout ) {
+        //Wait all queue clean
+        DEBUG_U_WRAP_SP_DB(LogMessage("%s: LF_SET, waiting ins\n", __func__));
+        while ( Spo_ProcQuery_QinsCheckAll(data) ) {
+            nanosleep(&t_elapse, NULL);
+        }
+        DEBUG_U_WRAP_SP_DB(LogMessage("%s: LF_SET, waiting ins done\n", __func__));
+
+        //Start from first queue
+        while ( (n=Spo_ProcQuery_GetQins(data, 0)) < 0 ) {
+            nanosleep(&t_elapse, NULL);
+        }
+        DEBUG_U_WRAP_SP_DB(LogMessage("%s: LF_SET, process next ins [%d]\n", __func__, n));
+        data->enc_q_ins = (uint8_t)n;
     }
 
-    if ( LF_SET==q_flushout || LF_SET_EMPTY==q_flushout ) {
+/*    if ( LF_SET==q_flushout || LF_SET_EMPTY==q_flushout ) {
         //Step to first query instance.
         data->enc_q_ins = 0;
-    }
+    }*/
 
     //Drop all data in queue;
-    dbEventQueueClean(q_ins);
+    //dbEventQueueClean(q_ins);
 
     return;
 }
@@ -3384,7 +3592,7 @@ char * snort_escape_string(char * from, DatabaseData * data) {
 /*
  Same function as above but will work on a static buffer, slightly different arguments...
  */
-u_int32_t snort_escape_string_STATIC(char *from, u_int32_t buffer_max_len,
+u_int32_t snort_escape_string_STATIC(char *from, char *buff_esc, u_int32_t buffer_max_len,
 		DatabaseData *data) {
 
 #if defined(ENABLE_POSTGRESQL)
@@ -3411,7 +3619,7 @@ u_int32_t snort_escape_string_STATIC(char *from, u_int32_t buffer_max_len,
 				__FUNCTION__, buffer_max_len);
 	}
 
-	memset(data->sanitize_buffer, '\0', DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN);
+	memset(buff_esc, '\0', DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN);
 
 	if ((from_length = strlen(from)) == 1) {
 		/* Nothing to escape */
@@ -3419,7 +3627,7 @@ u_int32_t snort_escape_string_STATIC(char *from, u_int32_t buffer_max_len,
 	}
 
 	from_start = from;
-	to = data->sanitize_buffer;
+	to = buff_esc;
 	to_start = to;
 
 	switch (data->dbtype_id) {
@@ -3601,12 +3809,12 @@ u_int32_t snort_escape_string_STATIC(char *from, u_int32_t buffer_max_len,
  * Returns: status of the update
  *
  ******************************************************************************/
-int UpdateLastCid(DatabaseData *data, uint8_t if_trans, uint8_t if_p)
+int UpdateLastCid(DatabaseData *data, uint8_t if_trans, uint8_t if_p, uint8_t q_sock)
 {
     int i;
 
     if ( if_trans ) {
-        if (BeginTransaction(data)) {
+        if (BeginTransaction(data, q_sock)) {
             FatalError(
                     "database [%s()]: Failed to Initialize transaction, bailing ... \n",
                     __FUNCTION__);
@@ -3614,14 +3822,14 @@ int UpdateLastCid(DatabaseData *data, uint8_t if_trans, uint8_t if_p)
     }
 
     for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
-        DatabaseCleanInsert(data);
-        if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH, "UPDATE sensor "
+        DatabaseCleanInsert(data, q_sock);
+        if ((SnortSnprintf(data->SQL_INSERT[q_sock], MAX_QUERY_LENGTH, "UPDATE sensor "
                 "SET last_cid = %lu, last_mcid = %lu "
                 "WHERE sid = %u AND bid = %u;", data->cid[i], data->ms_cid[i], data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
             return 1;
         }
 
-        if (Insert(data->SQL_INSERT, data, 1)) {
+        if (Insert(data->SQL_INSERT[q_sock], data, 1, q_sock)) {
             return 1;
         }
 
@@ -3634,14 +3842,14 @@ int UpdateLastCid(DatabaseData *data, uint8_t if_trans, uint8_t if_p)
     }
 
     if ( if_trans ) {
-        if (CommitTransaction(data)) {
+        if (CommitTransaction(data, q_sock)) {
             ErrorMessage("ERROR database: [%s()]: Error commiting transaction \n",
                     __FUNCTION__);
 
-            setTransactionCallFail(&data->dbRH[data->dbtype_id]);
+            setTransactionCallFail(&data->m_dbins[q_sock]);
             return 1;
         } else {
-            resetTransactionState(&data->dbRH[data->dbtype_id]);
+            resetTransactionState(&data->m_dbins[q_sock]);
         }
     }
 
@@ -3664,32 +3872,32 @@ int GetLastCid(DatabaseData *data)
     int i;
 
 	for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
-	    DatabaseCleanSelect(data);
+	    DatabaseCleanSelect(data, SPO_DB_DEF_INS);
 
 	    data->cid[i] = 0;
 	    data->ms_cid[i] = 0;
 
 #ifdef USI_CID_UINT_64
-	    if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH, "SELECT last_cid "
+	    if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH, "SELECT last_cid "
 	            "  FROM sensor "
 	            " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
 	        continue;
 	    }
-	    if (Select_bigint(data->SQL_SELECT, data, (us_cid_t*)&(data->cid[i]))) {
+	    if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*)&(data->cid[i]), SPO_DB_DEF_INS)) {
 	        ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
-	                data->SQL_SELECT);
+	                data->SQL_SELECT[SPO_DB_DEF_INS]);
 	        continue;
 	    }
 
         //mcid
-        if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH, "SELECT last_mcid "
+        if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH, "SELECT last_mcid "
                 "  FROM sensor "
                 " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
             continue;
         }
-        if (Select_bigint(data->SQL_SELECT, data, (us_cid_t*)&(data->ms_cid[i]))) {
+        if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*)&(data->ms_cid[i]), SPO_DB_DEF_INS)) {
             ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
-                    data->SQL_SELECT);
+                    data->SQL_SELECT[SPO_DB_DEF_INS]);
             continue;
         }
 #else
@@ -3737,17 +3945,17 @@ int GetLastCidFromTable(DatabaseData *data)
     for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
         for (itr = 0; itr < num_tables; itr++) {
             c_cid = 0;
-            DatabaseCleanSelect(data);
+            DatabaseCleanSelect(data, SPO_DB_DEF_INS);
 
 #ifdef USI_CID_UINT_64
-            if (SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+            if (SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
                     "SELECT MAX(cid) FROM %s WHERE sid='%u' AND bid='%u';", table_array[itr],
                     data->sid, i)) {
                 LogMessage("database: [%s()], was unable to build query \n",
                         __FUNCTION__);
                 return 1;
             }
-            if (Select_bigint(data->SQL_SELECT, data, (us_cid_t*) &c_cid)) {
+            if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*) &c_cid, SPO_DB_DEF_INS)) {
                 DEBUG_WRAP(DebugMessage(DB_DEBUG,"database: [%s()]: Problems executing [%s], (there is probably no row in the table for sensor id [%d] \n",
                                 __FUNCTION__,
                                 data->SQL_SELECT,
@@ -3798,7 +4006,7 @@ int CheckDBVersion(DatabaseData * data) {
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
 
 #if defined(ENABLE_MSSQL) || defined(ENABLE_ODBC)
 //   if ( data->dbtype_id == DB_MSSQL ||
@@ -3823,24 +4031,24 @@ int CheckDBVersion(DatabaseData * data) {
 			 *  to indicate that we are referring to the table
 			 */
 
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 					"SELECT vseq FROM `schema`")) != SNORT_SNPRINTF_SUCCESS) {
 				return 1;
 			}
 		} else
 #endif
 		{
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 					"SELECT vseq FROM schema")) != SNORT_SNPRINTF_SUCCESS) {
 				return 1;
 			}
 		}
 	}
 
-	if (Select(data->SQL_SELECT, data, (u_int32_t *) &data->DBschema_version)) {
+	if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, (u_int32_t *) &data->DBschema_version, SPO_DB_DEF_INS)) {
 		/* XXX */
 		ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
-				data->SQL_SELECT);
+				data->SQL_SELECT[SPO_DB_DEF_INS]);
 		return 1;
 	}
 
@@ -3866,14 +4074,14 @@ int CheckDBVersion(DatabaseData * data) {
  * Purpose: Database independent SQL to start a transaction
  *
  ******************************************************************************/
-u_int32_t BeginTransaction(DatabaseData * data) {
+u_int32_t BeginTransaction(DatabaseData * data, uint8_t q_sock)
+{
 	if (data == NULL) {
-		/* XXX */
 		FatalError("database [%s()], Invoked with NULL DatabaseData \n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionState(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionState(&data->m_dbins[q_sock])) {
 		/* We already are in a transaction, possible nested call do not sub BEGIN..*/
 		return 0;
 	}
@@ -3906,16 +4114,14 @@ u_int32_t BeginTransaction(DatabaseData * data) {
 #endif
 
 	default:
-		setTransactionState(&data->dbRH[data->dbtype_id]);
-		if (Insert("BEGIN;", data, 0)) {
-			/*XXX */
+		setTransactionState(&data->m_dbins[q_sock]);
+		if (Insert("BEGIN;", data, 0, q_sock)) {
 			return 1;
 		}
 		return 0;
 		break;
 	}
 
-	/* XXX */
 	return 1;
 }
 
@@ -3925,7 +4131,7 @@ u_int32_t BeginTransaction(DatabaseData * data) {
  * Purpose: Database independent SQL to commit a transaction
  *
  ******************************************************************************/
-u_int32_t CommitTransaction(DatabaseData * data) {
+u_int32_t CommitTransaction(DatabaseData * data, uint8_t q_sock) {
 
 	if (data == NULL) {
 		/* XXX */
@@ -3933,7 +4139,7 @@ u_int32_t CommitTransaction(DatabaseData * data) {
 				__FUNCTION__);
 	}
 
-	if ((checkTransactionState(&data->dbRH[data->dbtype_id])) == 0) {
+	if ((checkTransactionState(&data->m_dbins[q_sock])) == 0) {
 		LogMessage(" We are not in a transaction, effect of some possible nested call be quiet ");
 		return 0;
 	}
@@ -3972,7 +4178,7 @@ u_int32_t CommitTransaction(DatabaseData * data) {
 
 	default:
 
-		if (Insert("COMMIT;", data, 1)) {
+		if (Insert("COMMIT;", data, 1, q_sock)) {
 			/*XXX */
 			return 1;
 		}
@@ -3987,7 +4193,7 @@ u_int32_t CommitTransaction(DatabaseData * data) {
 
 transaction_success:
 	/* Reset the transaction error count */
-	resetTransactionState(&data->dbRH[data->dbtype_id]);
+	resetTransactionState(&data->m_dbins[q_sock]);
 	return 0;
 
 }
@@ -3998,16 +4204,15 @@ transaction_success:
  * Purpose: Database independent SQL to rollback a transaction
  *
  ******************************************************************************/
-u_int32_t RollbackTransaction(DatabaseData * data) {
+u_int32_t RollbackTransaction(DatabaseData * data, uint8_t q_sock)
+{
 	if (data == NULL) {
-		/* XXX */
 		FatalError("database [%s()], Invoked with NULL DatabaseData \n",
 				__FUNCTION__);
 	}
 
-	if (data->dbRH[data->dbtype_id].transactionErrorCount
+	if (data->m_dbins[q_sock].transactionErrorCount
 			> data->dbRH[data->dbtype_id].transactionErrorThreshold) {
-		/* XXX */
 		LogMessage(
 				"[%s(): Call failed, we reached the maximum number of transaction error [%u] \n",
 				__FUNCTION__,
@@ -4016,25 +4221,24 @@ u_int32_t RollbackTransaction(DatabaseData * data) {
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
+			&data->dbRH[data->dbtype_id], q_sock))) {
 		LogMessage("[%s()] Call failed check to dbConnectionStatus()\n",
 				__FUNCTION__);
 		return 1;
 	}
 
-	if ((checkTransactionState(&data->dbRH[data->dbtype_id])) == 0) {
+	if ((checkTransactionState(&data->m_dbins[q_sock])) == 0) {
 		/* We reached a rollback when not in transaction state announce it */
 		LogMessage("[%s()] : called while not in transaction \n", __FUNCTION__);
 		return 1;
 	}
 
-	if (getReconnectState(&data->dbRH[data->dbtype_id])) {
+	if (getReconnectState(&data->m_dbins[q_sock])) {
 		/* Since We could get called from different places we are gown up and reset out self. */
-		resetTransactionState(&data->dbRH[data->dbtype_id]);
+		resetTransactionState(&data->m_dbins[q_sock]);
 		/* We reconnected, transaction call failed , we can't call "ROLLBACK" since the transaction should have aborted  */
 		/* We reset state */
-		setReconnectState(&data->dbRH[data->dbtype_id], 0);
+		setReconnectState(&data->m_dbins[q_sock], 0);
 		return 0;
 	}
 
@@ -4061,1381 +4265,55 @@ u_int32_t RollbackTransaction(DatabaseData * data) {
 	break;
 #endif
 	default:
-		return Insert("ROLLBACK;", data, 0);
+		return Insert("ROLLBACK;", data, 0, q_sock);
 	}
 
 	/* XXX */
 	return 1;
 }
 
-/*******************************************************************************
- * Function: Insert(char * query, DatabaseData * data)
- *
- * Purpose: Database independent function for SQL inserts
- *
- * Arguments: query (An SQL insert)
- *
- * Returns:
- * 0 OK
- * 1 Error
- ******************************************************************************/
-int Insert(char * query, DatabaseData * data, u_int32_t inTransac)
-{
-#ifdef ENABLE_ODBC
-	long fRes = 0;
-#endif
-
-#if defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL)
-	int result = 0;
-#endif /* defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL) */
-
-	if ((query == NULL) || (data == NULL) || checkDatabaseType(data)) {
-		LogMessage("Invalid queryString or data configure\n");
-		return 1;
-	}
-
-	/* This mainly has been set for Rollback */
-	if ( (1==inTransac) || (2 == inTransac)) {
-		if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
-			/* A This shouldn't happen since we are in failed transaction state */
-			LogMessage("in failed transaction state, stop proceed Insertion\n");
-			return 1;
-		}
-	}
-
-	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		LogMessage("Insert Query[%s] failed check to dbConnectionStatus()\n",
-				query);
-		return 1;
-	}
-
-#ifdef ENABLE_POSTGRESQL
-	if( data->dbtype_id == DB_POSTGRESQL )
-	{
-		data->p_result = PQexec(data->p_connection,query);
-		if(!(PQresultStatus(data->p_result) != PGRES_COMMAND_OK))
-		{
-			result = 0;
-		}
-		else
-		{
-			if(PQerrorMessage(data->p_connection)[0] != '\0')
-			{
-				ErrorMessage("ERROR database: database: postgresql_error: %s\n",
-						PQerrorMessage(data->p_connection));
-				return 1;
-			}
-		}
-		PQclear(data->p_result);
-		data->p_result = NULL;
-		return 0;
-	}
-#endif
-
-#ifdef ENABLE_MYSQL
-	if (data->dbtype_id == DB_MYSQL) {
-		result = mysql_query(data->m_sock, query);
-
-		switch (result) {
-
-		case 0:
-			return 0;
-			break;
-
-		case CR_COMMANDS_OUT_OF_SYNC:
-		case CR_SERVER_GONE_ERROR:
-		case CR_UNKNOWN_ERROR:
-		default:
-			/* XXX */
-			/* Could lead to some corruption lets exit nicely .. */
-			/* Since this model of the database incluse a lot of atomic queries .....*/
-			if ((mysql_errno(data->m_sock))) {
-
-				FatalError("database mysql_error: %s, errno: %d\n\tSQL=[%s]\n",
-						mysql_error(data->m_sock), mysql_errno(data->m_sock), query);
-
-			} else {
-				LogMessage("Unknown SQL error(return:%d), Insertion failed\n", result);
-				return 1;
-			}
-			break;
-		}
-
-	}
-#endif
-
-#ifdef ENABLE_ODBC
-	if(data->dbtype_id == DB_ODBC)
-	{
-		if(SQLAllocHandle(SQL_HANDLE_STMT,data->u_connection, &data->u_statement) == SQL_SUCCESS)
-		{
-			fRes = SQLExecDirect(data->u_statement,(ODBC_SQLCHAR *)query, SQL_NTS);
-
-			if( (fRes != SQL_SUCCESS) ||
-					(fRes != SQL_SUCCESS_WITH_INFO))
-			{
-				result = 0;
-				SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-				return 0;
-			}
-			else
-			{
-				LogMessage("execdirect failed \n");
-			}
-		}
-		else
-		{
-			LogMessage("stmtalloc failed \n");
-		}
-
-		LogMessage("[%s()], failed insert [%s], \n",
-				__FUNCTION__,
-				query);
-		ODBCPrintError(data,SQL_HANDLE_STMT);
-		SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-	}
-#endif
-
-#ifdef ENABLE_ORACLE
-	if(data->dbtype_id == DB_ORACLE)
-	{
-		char *blob = NULL;
-
-		/* If BLOB type - split query to actual SQL and blob to BLOB data */
-		if(strncasecmp(query,"INSERT INTO data",16)==0 || strncasecmp(query,"INSERT INTO opt",15)==0)
-		{
-			if((blob=strchr(query,'|')) != NULL)
-			{
-				*blob='\0'; blob++;
-			}
-		}
-
-		if(OCI_SUCCESS == OCIStmtPrepare(data->o_statement
-						, data->o_error
-						, query
-						, strlen(query)
-						, OCI_NTV_SYNTAX
-						, OCI_DEFAULT))
-		{
-			if( blob != NULL )
-			{
-				OCIBindByPos(data->o_statement
-						, &data->o_bind
-						, data->o_error
-						, 1
-						, (dvoid *)blob
-						, strlen(blob)
-						, SQLT_BIN
-						, 0
-						, 0
-						, 0
-						, 0
-						, 0
-						, OCI_DEFAULT);
-			}
-
-			if(OCI_SUCCESS == OCIStmtExecute(data->o_servicecontext
-							, data->o_statement
-							, data->o_error
-							, 1
-							, 0
-							, NULL
-							, NULL
-							, OCI_COMMIT_ON_SUCCESS))
-			{
-				result = 0;
-			}
-		}
-
-		if( result != 1 )
-		{
-			OCIErrorGet(data->o_error
-					, 1
-					, NULL
-					, &data->o_errorcode
-					, data->o_errormsg
-					, sizeof(data->o_errormsg)
-					, OCI_HTYPE_ERROR);
-			ErrorMessage("ERROR database: database: oracle_error: %s\n", data->o_errormsg);
-			ErrorMessage("        : query: %s\n", query);
-		}
-	}
-#endif
-
-#ifdef ENABLE_MSSQL
-	if(data->dbtype_id == DB_MSSQL)
-	{
-		SAVESTATEMENT(query);
-		dbfreebuf(data->ms_dbproc);
-		if( dbcmd(data->ms_dbproc, query) == SUCCEED )
-		if( dbsqlexec(data->ms_dbproc) == SUCCEED )
-		if( dbresults(data->ms_dbproc) == SUCCEED )
-		{
-			while (dbnextrow(data->ms_dbproc) != NO_MORE_ROWS)
-			{
-				result = (int)data->ms_col;
-			}
-			result = 0;
-		}
-		CLEARSTATEMENT();
-	}
-#endif
-
-	return 1;
-}
-
-/*******************************************************************************
- * Function: Insert(char * query, DatabaseData * data)
- *
- * Purpose: Database independent function for SQL inserts
- *
- * Arguments: query (An SQL insert)
- *
- * Returns:
- * 0 OK
- * 1 Error
- ******************************************************************************/
-int Insert_real(char * query, uint32_t query_len, DatabaseData * data, u_int32_t inTransac)
-{
-#ifdef ENABLE_ODBC
-    long fRes = 0;
-#endif
-
-#if defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL)
-    int result = 0;
-#endif /* defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL) */
-
-    if ((query == NULL) || (data == NULL) || checkDatabaseType(data)) {
-        /* XXX */
-        return 1;
-    }
-
-    /* This mainly has been set for Rollback */
-    if (inTransac == 1) {
-        if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
-            /* A This shouldn't happen since we are in failed transaction state */
-            /* XXX */
-            return 1;
-        }
-    }
-
-    if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-            &data->dbRH[data->dbtype_id]))) {
-        /* XXX */
-        LogMessage("Insert Query[%s] failed check to dbConnectionStatus()\n",
-                query);
-        return 1;
-    }
-
-#ifdef ENABLE_POSTGRESQL
-    if( data->dbtype_id == DB_POSTGRESQL )
-    {
-        data->p_result = PQexec(data->p_connection,query);
-        if(!(PQresultStatus(data->p_result) != PGRES_COMMAND_OK))
-        {
-            result = 0;
-        }
-        else
-        {
-            if(PQerrorMessage(data->p_connection)[0] != '\0')
-            {
-                ErrorMessage("ERROR database: database: postgresql_error: %s\n",
-                        PQerrorMessage(data->p_connection));
-                return 1;
-            }
-        }
-        PQclear(data->p_result);
-        data->p_result = NULL;
-        return 0;
-    }
-#endif
-
-#ifdef ENABLE_MYSQL
-    if (data->dbtype_id == DB_MYSQL) {
-        result = mysql_real_query(data->m_sock, query, query_len);
-
-        switch (result) {
-
-        case 0:
-            return 0;
-            break;
-
-        case CR_COMMANDS_OUT_OF_SYNC:
-        case CR_SERVER_GONE_ERROR:
-        case CR_UNKNOWN_ERROR:
-        default:
-            /* XXX */
-            /* Could lead to some corruption lets exit nicely .. */
-            /* Since this model of the database incluse a lot of atomic queries .....*/
-            if ((mysql_errno(data->m_sock))) {
-
-                FatalError("database mysql_error: %s\n\tSQL=[%s]\n",
-                        mysql_error(data->m_sock), query);
-
-            } else {
-                /* XXX */
-                return 1;
-            }
-            break;
-        }
-
-    }
-#endif
-
-#ifdef ENABLE_ODBC
-    if(data->dbtype_id == DB_ODBC)
-    {
-        if(SQLAllocHandle(SQL_HANDLE_STMT,data->u_connection, &data->u_statement) == SQL_SUCCESS)
-        {
-            fRes = SQLExecDirect(data->u_statement,(ODBC_SQLCHAR *)query, SQL_NTS);
-
-            if( (fRes != SQL_SUCCESS) ||
-                    (fRes != SQL_SUCCESS_WITH_INFO))
-            {
-                result = 0;
-                SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-                return 0;
-            }
-            else
-            {
-                LogMessage("execdirect failed \n");
-            }
-        }
-        else
-        {
-            LogMessage("stmtalloc failed \n");
-        }
-
-        LogMessage("[%s()], failed insert [%s], \n",
-                __FUNCTION__,
-                query);
-        ODBCPrintError(data,SQL_HANDLE_STMT);
-        SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-    }
-#endif
-
-#ifdef ENABLE_ORACLE
-    if(data->dbtype_id == DB_ORACLE)
-    {
-        char *blob = NULL;
-
-        /* If BLOB type - split query to actual SQL and blob to BLOB data */
-        if(strncasecmp(query,"INSERT INTO data",16)==0 || strncasecmp(query,"INSERT INTO opt",15)==0)
-        {
-            if((blob=strchr(query,'|')) != NULL)
-            {
-                *blob='\0'; blob++;
-            }
-        }
-
-        if(OCI_SUCCESS == OCIStmtPrepare(data->o_statement
-                        , data->o_error
-                        , query
-                        , strlen(query)
-                        , OCI_NTV_SYNTAX
-                        , OCI_DEFAULT))
-        {
-            if( blob != NULL )
-            {
-                OCIBindByPos(data->o_statement
-                        , &data->o_bind
-                        , data->o_error
-                        , 1
-                        , (dvoid *)blob
-                        , strlen(blob)
-                        , SQLT_BIN
-                        , 0
-                        , 0
-                        , 0
-                        , 0
-                        , 0
-                        , OCI_DEFAULT);
-            }
-
-            if(OCI_SUCCESS == OCIStmtExecute(data->o_servicecontext
-                            , data->o_statement
-                            , data->o_error
-                            , 1
-                            , 0
-                            , NULL
-                            , NULL
-                            , OCI_COMMIT_ON_SUCCESS))
-            {
-                result = 0;
-            }
-        }
-
-        if( result != 1 )
-        {
-            OCIErrorGet(data->o_error
-                    , 1
-                    , NULL
-                    , &data->o_errorcode
-                    , data->o_errormsg
-                    , sizeof(data->o_errormsg)
-                    , OCI_HTYPE_ERROR);
-            ErrorMessage("ERROR database: database: oracle_error: %s\n", data->o_errormsg);
-            ErrorMessage("        : query: %s\n", query);
-        }
-    }
-#endif
-
-#ifdef ENABLE_MSSQL
-    if(data->dbtype_id == DB_MSSQL)
-    {
-        SAVESTATEMENT(query);
-        dbfreebuf(data->ms_dbproc);
-        if( dbcmd(data->ms_dbproc, query) == SUCCEED )
-        if( dbsqlexec(data->ms_dbproc) == SUCCEED )
-        if( dbresults(data->ms_dbproc) == SUCCEED )
-        {
-            while (dbnextrow(data->ms_dbproc) != NO_MORE_ROWS)
-            {
-                result = (int)data->ms_col;
-            }
-            result = 0;
-        }
-        CLEARSTATEMENT();
-    }
-#endif
-
-    return 1;
-}
-
-/*******************************************************************************
- * Function: Select(char * query, DatabaeData * data, u_int32_t *rval)
- *
- *
- *
- * Returns:
- * 0 OK
- * 1 ERROR
- ******************************************************************************/
-int Select(char * query, DatabaseData * data, u_int32_t *rval)
-{
-#if defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL)
-	int result = 0;
-#endif /* defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL) */
-	uint8_t retry_num = 10;
-
-	if ((query == NULL) || (data == NULL) || (rval == NULL)) {
-		/* XXX */
-		FatalError(
-				"database [%s()] Invoked with a NULL argument Query [0x%x] Data [0x%x] rval [0x%x] \n",
-				__FUNCTION__, query, data, rval);
-	}
-
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
-		/* A This shouldn't happen since we are in failed transaction state */
-		/* XXX */
-		return 1;
-	}
-#if defined(ENABLE_MYSQL)
-	Select_reconnect:
-#endif /* defined(ENABLE_MYSQL) */
-
-	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
-		FatalError(
-				"database Select Query[%s] failed check to dbConnectionStatus()\n",
-				query);
-	}
-
-	switch (data->dbtype_id) {
-
-#ifdef ENABLE_POSTGRESQL
-	case DB_POSTGRESQL:
-
-	data->p_result = PQexec(data->p_connection,query);
-	if((PQresultStatus(data->p_result) == PGRES_TUPLES_OK))
-	{
-		if(PQntuples(data->p_result))
-		{
-			if((PQntuples(data->p_result)) > 1)
-			{
-				ErrorMessage("ERROR database: Query [%s] returned more than one result\n",
-						query);
-				result = 0;
-				PQclear(data->p_result);
-				data->p_result = NULL;
-				return 1;
-			}
-			else
-			{
-				*rval = atoi(PQgetvalue(data->p_result,0,0));
-			}
-		}
-		else
-		{
-			PQclear(data->p_result);
-			data->p_result = NULL;
-			return 1;
-		}
-	}
-
-	if(!result)
-	{
-		if(PQerrorMessage(data->p_connection)[0] != '\0')
-		{
-			ErrorMessage("ERROR database: postgresql_error: %s\n",
-					PQerrorMessage(data->p_connection));
-			return 1;
-		}
-	}
-
-	PQclear(data->p_result);
-	data->p_result = NULL;
-	break;
-#endif
-
-#ifdef ENABLE_MYSQL
-	case DB_MYSQL:
-
-		result = mysql_query(data->m_sock, query);
-
-		switch (result) {
-		case 0:
-			if ((data->m_result = mysql_use_result(data->m_sock)) == NULL) {
-				/* XXX */
-				*rval = 0;
-				return 1;
-			} else {
-				if ((data->m_row = mysql_fetch_row(data->m_result)) == NULL) {
-					/* XXX */
-					*rval = 0;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
-					return 1;
-				} else {
-					if (data->m_row[0] != NULL) {
-						*rval = atoi(data->m_row[0]);
-					} else {
-						/* XXX */
-						*rval = 0;
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
-						return 1;
-					}
-
-				}
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
-				return 0;
-			}
-			break;
-
-		case CR_COMMANDS_OUT_OF_SYNC:
-		case CR_SERVER_GONE_ERROR:
-		case CR_UNKNOWN_ERROR:
-		default:
-
-			if (checkTransactionState(data->dbRH)) {
-				LogMessage(
-						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n"
-								"\t Failed QUERY: [%s] \n", __FUNCTION__,
-						mysql_error(data->m_sock), query);
-				return 1;
-			}
-
-			LogMessage("[%s()]: Failed to execute with error [%s], query [%s]",
-			        __FUNCTION__, mysql_error(data->m_sock), query);
-			if ( retry_num-- ) {
-			    LogMessage(", will retry \n");
-			}
-			else {
-			    LogMessage(", abort \n");
-			    return 1;
-			}
-
-			goto Select_reconnect;
-			break;
-		}
-
-		/* XXX */
-		*rval = 0;
-		return 1;
-
-		break;
-
-#endif
-
-#ifdef ENABLE_ODBC
-		case DB_ODBC:
-
-		if(SQLAllocHandle(SQL_HANDLE_STMT,data->u_connection, &data->u_statement) == SQL_SUCCESS)
-		{
-			//if(SQLPrepare(data->u_statement, (ODBC_SQLCHAR *)query, SQL_NTS) == SQL_SUCCESS)
-			//{
-			//if(SQLExecute(data->u_statement) == SQL_SUCCESS)
-			if(SQLExecDirect(data->u_statement,(ODBC_SQLCHAR *)query, SQL_NTS) == SQL_SUCCESS)
-			{
-				if(SQLRowCount(data->u_statement, &data->u_rows) == SQL_SUCCESS)
-				{
-					if(data->u_rows)
-					{
-						if(data->u_rows > 1)
-						{
-							SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-							ErrorMessage("ERROR database: Query [%s] returned more than one result\n", query);
-							result = 0;
-							return 1;
-						}
-						else
-						{
-							if(SQLFetch(data->u_statement) == SQL_SUCCESS)
-							{
-								if(SQLGetData(data->u_statement,1,SQL_INTEGER,
-												&data->u_col,
-												sizeof(data->u_col), NULL) == SQL_SUCCESS)
-								{
-									*rval = (int)data->u_col;
-									SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-
-								}
-							}
-							else
-							{
-								SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-								return 1;
-							}
-						}
-					}
-					else
-					{
-						SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-						return 1;
-					}
-				}
-			}
-		}
-		break;
-#endif
-
-#ifdef ENABLE_ORACLE
-		case DB_ORACLE:
-
-		int success = 0; /* assume it will fail */
-		if(OCI_SUCCESS == OCIStmtPrepare(data->o_statement
-						, data->o_error
-						, query
-						, strlen(query)
-						, OCI_NTV_SYNTAX
-						, OCI_DEFAULT))
-		{
-			if(OCI_SUCCESS == OCIDefineByPos(data->o_statement
-							, &data->o_define
-							, data->o_error
-							, 1
-							, &result
-							, sizeof(result)
-							, SQLT_INT
-							, 0
-							, 0
-							, 0
-							, OCI_DEFAULT))
-			{
-				sword status;
-				status = OCIStmtExecute(data->o_servicecontext
-						, data->o_statement
-						, data->o_error
-						, 1 /*0*/
-						, 0
-						, NULL
-						, NULL
-						, OCI_DEFAULT);
-				if( status==OCI_SUCCESS || status==OCI_NO_DATA )
-				{
-					success = 1;
-				}
-			}
-		}
-
-		if( ! success )
-		{
-			OCIErrorGet(data->o_error
-					, 1
-					, NULL
-					, &data->o_errorcode
-					, data->o_errormsg
-					, sizeof(data->o_errormsg)
-					, OCI_HTYPE_ERROR);
-			ErrorMessage("ERROR database: database: oracle_error: %s\n", data->o_errormsg);
-			ErrorMessage("        : query: %s\n", query);
-		}
-
-		break;
-#endif
-
-#ifdef ENABLE_MSSQL
-		case DB_MSSQL:
-
-		SAVESTATEMENT(query);
-		dbfreebuf(data->ms_dbproc);
-		if( dbcmd(data->ms_dbproc, query) == SUCCEED )
-		if( dbsqlexec(data->ms_dbproc) == SUCCEED )
-		if( dbresults(data->ms_dbproc) == SUCCEED )
-		if( dbbind(data->ms_dbproc, 1, INTBIND, (DBINT) 0, (BYTE *) &data->ms_col) == SUCCEED )
-		while (dbnextrow(data->ms_dbproc) != NO_MORE_ROWS)
-		{
-			result = (int)data->ms_col;
-		}
-		CLEARSTATEMENT();
-
-		break;
-
-#endif
-
-	default:
-		FatalError(
-				"database [%s()]: Invoked with unknown database type [%u] \n",
-				__FUNCTION__, data->dbtype_id);
-	}
-
-	return 0;
-}
-
-/*******************************************************************************
- * Function: Select(char * query, DatabaeData * data, uint64_t *rval)
- *
- *
- *
- * Returns:
- * 0 OK
- * 1 ERROR
- ******************************************************************************/
-int Select_bigint(char * query, DatabaseData * data, uint64_t *rval)
-{
-#if defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL)
-	int result = 0;
-#endif /* defined(ENABLE_MYSQL) || defined(ENABLE_POSTGRESQL) */
-	uint8_t retry_num = 10;
-	char *p;
-
-	if ((query == NULL) || (data == NULL) || (rval == NULL)) {
-		/* XXX */
-		FatalError(
-				"database [%s()] Invoked with a NULL argument Query [0x%x] Data [0x%x] rval [0x%x] \n",
-				__FUNCTION__, query, data, rval);
-	}
-
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
-		/* A This shouldn't happen since we are in failed transaction state */
-		/* XXX */
-		return 1;
-	}
-#if defined(ENABLE_MYSQL)
-	Select_reconnect:
-#endif /* defined(ENABLE_MYSQL) */
-
-	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
-		FatalError(
-				"database Select Query[%s] failed check to dbConnectionStatus()\n",
-				query);
-	}
-
-	switch (data->dbtype_id) {
-#ifdef ENABLE_MYSQL
-	case DB_MYSQL:
-		result = mysql_query(data->m_sock, query);
-		switch (result) {
-		case 0:
-			if ((data->m_result = mysql_use_result(data->m_sock)) == NULL) {
-				/* XXX */
-				*rval = 0;
-				return 1;
-			} else {
-				if ((data->m_row = mysql_fetch_row(data->m_result)) == NULL) {
-					/* XXX */
-					*rval = 0;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
-					return 1;
-				} else {
-					if (data->m_row[0] != NULL) {
-						*rval = strtoul(data->m_row[0], &p, 10);
-					} else {
-						/* XXX */
-						*rval = 0;
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
-						return 1;
-					}
-
-				}
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
-				return 0;
-			}
-			break;
-
-		case CR_COMMANDS_OUT_OF_SYNC:
-		case CR_SERVER_GONE_ERROR:
-		case CR_UNKNOWN_ERROR:
-		default:
-
-			if (checkTransactionState(data->dbRH)) {
-				LogMessage(
-						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n"
-								"\t Failed QUERY: [%s] \n", __FUNCTION__,
-						mysql_error(data->m_sock), query);
-				return 1;
-			}
-
-			LogMessage("[%s()]: Failed to execute with error [%s], query [%s]",
-			        __FUNCTION__, mysql_error(data->m_sock), query);
-			if ( retry_num-- ) {
-			    LogMessage(", will retry \n");
-			}
-			else {
-			    LogMessage(", abort \n");
-			    return 1;
-			}
-
-			goto Select_reconnect;
-			break;
-		}
-
-		/* XXX */
-		*rval = 0;
-		return 1;
-		break;
-#endif
-	default:
-		FatalError(
-				"database [%s()]: Invoked with unknown database type [%u] \n",
-				__FUNCTION__, data->dbtype_id);
-	}
-
-	return 0;
-}
-
-/*******************************************************************************
- * Function: Connect(DatabaseData * data)
- *
- * Purpose: Database independent function to initiate a database
- *          connection
- *
- ******************************************************************************/
-void Connect(DatabaseData * data) {
-
-#ifdef ENABLE_ODBC
-	ODBC_SQLRETURN ret;
-#endif /* ENABLE_ODBC */
-
-	if (data == NULL) {
-		/* XXX */
-		FatalError(
-				"database [%s()]: Invoked with NULL DatabaseData argument \n",
-				__FUNCTION__);
-	}
-
-	switch (data->dbtype_id) {
-
-#ifdef ENABLE_POSTGRESQL
-	case DB_POSTGRESQL:
-
-#ifdef HAVE_PQPING
-	/* Set PQPing String */
-	memset(data->p_pingString,'\0',1024);
-	if(SnortSnprintf(data->p_pingString,1024,"host='%s' port='%s' user='%s' dbname='%s'",
-					data->host,
-					data->port == NULL ? "5432" : data->port,
-					data->user,
-					data->dbname))
-	{
-		/* XXX */
-		FatalError("[%s()],unable to create PQPing connection string.. bailing \n",
-				__FUNCTION__);
-	}
-#endif
-
-	if (data->use_ssl == 1)
-	{
-		data->p_connection =
-		PQsetdbLogin(data->host,
-				data->port,
-				data->dbRH[data->dbtype_id].ssl_mode,
-				NULL,
-				data->dbname,
-				data->user,
-				data->password);
-	}
-	else
-	{
-		data->p_connection =
-		PQsetdbLogin(data->host,
-				data->port,
-				NULL,
-				NULL,
-				data->dbname,
-				data->user,
-				data->password);
-	}
-
-	if(PQstatus(data->p_connection) == CONNECTION_BAD)
-	{
-		PQfinish(data->p_connection);
-		data->p_connection = NULL;
-		FatalError("database Connection to database '%s' failed\n", data->dbname);
-	}
-	break;
-#endif
-
-#ifdef ENABLE_MYSQL
-	case DB_MYSQL:
-
-		data->m_sock = mysql_init(NULL);
-		if (data->m_sock == NULL) {
-			FatalError("database Connection to database '%s' failed\n",
-					data->dbname);
-		}
-
-		/* check if we want to connect with ssl options */
-		if (data->use_ssl == 1) {
-			mysql_ssl_set(data->m_sock, data->dbRH[data->dbtype_id].ssl_key,
-					data->dbRH[data->dbtype_id].ssl_cert,
-					data->dbRH[data->dbtype_id].ssl_ca,
-					data->dbRH[data->dbtype_id].ssl_ca_path,
-					data->dbRH[data->dbtype_id].ssl_cipher);
-		}
-
-		if (mysql_real_connect(data->m_sock, data->host, data->user,
-				data->password, data->dbname,
-				data->port == NULL ? 0 : atoi(data->port), NULL, CLIENT_INTERACTIVE) == NULL) {
-			if (mysql_errno(data->m_sock)) {
-				LogMessage("database mysql_error: %s\n",
-						mysql_error(data->m_sock));
-				mysql_close(data->m_sock);
-				data->m_sock = NULL;
-				CleanExit(1);
-			}
-
-			LogMessage("database Failed to logon to database '%s'\n",
-					data->dbname);
-			mysql_close(data->m_sock);
-			data->m_sock = NULL;
-			CleanExit(1);
-		}
-
-		if (mysql_autocommit(data->m_sock, 0)) {
-			/* XXX */
-			mysql_close(data->m_sock);
-			data->m_sock = NULL;
-			LogMessage("WARNING database: unable to unset autocommit\n");
-			return;
-		}
-
-		data->dbRH[data->dbtype_id].pThreadID = mysql_thread_id(data->m_sock);
-
-		break;
-#endif  /* ENABLE_MYSQL */
-
-#ifdef ENABLE_ODBC
-
-		case DB_ODBC:
-		data->u_underlying_dbtype_id = DB_UNDEFINED;
-
-		if(!(SQLAllocEnv(&data->u_handle) == SQL_SUCCESS))
-		{
-			FatalError("database unable to allocate ODBC environment\n");
-		}
-		if(!(SQLAllocConnect(data->u_handle, &data->u_connection) == SQL_SUCCESS))
-		{
-			FatalError("database unable to allocate ODBC connection handle\n");
-		}
-
-		/* The SQL Server ODBC driver always returns SQL_SUCCESS_WITH_INFO
-		 * on a successful SQLConnect, SQLDriverConnect, or SQLBrowseConnect.
-		 * When an ODBC application calls SQLGetDiagRec after getting
-		 * SQL_SUCCESS_WITH_INFO, it can receive the following messages:
-		 * 5701 - Indicates that SQL Server put the user's context into the
-		 *        default database defined in the data source, or into the
-		 *        default database defined for the login ID used in the
-		 *        connection if the data source did not have a default database.
-		 * 5703 - Indicates the language being used on the server.
-		 * You can ignore messages 5701 and 5703; they are only informational.
-		 */
-		ret = SQLConnect( data->u_connection
-				, (ODBC_SQLCHAR *)data->dbname
-				, SQL_NTS
-				, (ODBC_SQLCHAR *)data->user
-				, SQL_NTS
-				, (ODBC_SQLCHAR *)data->password
-				, SQL_NTS);
-
-		if( (ret != SQL_SUCCESS) &&
-				(ret != SQL_SUCCESS_WITH_INFO))
-		{
-			ODBCPrintError(data,SQL_HANDLE_DBC);
-			FatalError("database ODBC unable to connect.\n");
-		}
-
-		/* NOTE: -elz
-		 The code below was commented for review, since we want to streamline the api and remove
-		 all SQLGetDiagRec call's.
-
-		 */
-		//int  encounteredFailure = 1;  /* assume there is an error */
-		/*
-		 char odbcError[2000];
-		 odbcError[0] = '\0';
-
-		 if( ret == SQL_SUCCESS_WITH_INFO )
-		 {
-
-		 ODBC_SQLCHAR   sqlState[6];
-		 ODBC_SQLCHAR   msg[SQL_MAX_MESSAGE_LENGTH];
-		 SQLINTEGER     nativeError;
-		 SQLSMALLINT    errorIndex = 1;
-		 SQLSMALLINT    msgLen;
-		 */
-		/* assume no error unless nativeError tells us otherwise */
-		//encounteredFailure = 0;
-		/*
-		 while ((ret = SQLGetDiagRec( SQL_HANDLE_DBC
-		 , data->u_connection
-		 , errorIndex
-		 , sqlState
-		 , &nativeError
-		 , msg
-		 , SQL_MAX_MESSAGE_LENGTH
-		 , &msgLen)) != SQL_NO_DATA)
-		 {
-		 if( strstr((const char *)msg, "SQL Server") != NULL )
-		 {
-		 data->u_underlying_dbtype_id = DB_MSSQL;
-		 }
-
-		 if( nativeError!=5701 && nativeError!=5703 )
-		 {
-		 encounteredFailure = 1;
-		 strncat(odbcError, (const char *)msg, sizeof(odbcError));
-		 }
-		 errorIndex++;
-		 }
-		 }
-		 if( encounteredFailure )
-		 {
-
-		 }
-		 */
-
-		break;
-#endif
-
-#ifdef ENABLE_ORACLE
-
-		case DB_ORACLE:
-
-#define PRINT_ORACLE_ERR(func_name) \
-     { \
-         OCIErrorGet(data->o_error, 1, NULL, &data->o_errorcode, \
-                     data->o_errormsg, sizeof(data->o_errormsg), OCI_HTYPE_ERROR); \
-         ErrorMessage("ERROR database: Oracle_error: %s\n", data->o_errormsg); \
-         FatalError("database  %s : Connection to database '%s' failed\n", \
-                    func_name, data->dbRH[data->dbtype_id]->dbname); \
-     }
-
-		if (!getenv("ORACLE_HOME"))
-		{
-			ErrorMessage("ERROR database: ORACLE_HOME environment variable not set\n");
-		}
-
-		if (!data->user || !data->password || !data->dbRH[data->dbtype_id]->dbname)
-		{
-			ErrorMessage("ERROR database: user, password and dbname required for Oracle\n");
-			ErrorMessage("ERROR database: dbname must also be in tnsnames.ora\n");
-		}
-
-		if (data->host)
-		{
-			ErrorMessage("ERROR database: hostname not required for Oracle, use dbname\n");
-			ErrorMessage("ERROR database: dbname  must be in tnsnames.ora\n");
-		}
-
-		if (OCIInitialize(OCI_DEFAULT, NULL, NULL, NULL, NULL))
-		PRINT_ORACLE_ERR("OCIInitialize");
-
-		if (OCIEnvInit(&data->o_environment, OCI_DEFAULT, 0, NULL))
-		PRINT_ORACLE_ERR("OCIEnvInit");
-
-		if (OCIEnvInit(&data->o_environment, OCI_DEFAULT, 0, NULL))
-		PRINT_ORACLE_ERR("OCIEnvInit (2)");
-
-		if (OCIHandleAlloc(data->o_environment, (dvoid **)&data->o_error, OCI_HTYPE_ERROR, (size_t) 0, NULL))
-		PRINT_ORACLE_ERR("OCIHandleAlloc");
-
-		if (OCILogon(data->o_environment, data->o_error, &data->o_servicecontext,
-						data->user, strlen(data->user), data->password, strlen(data->password),
-						data->dbRH[data->dbtype_id]->dbname, strlen(data->dbRH[data->dbtype_id]->dbname)))
-		{
-			OCIErrorGet(data->o_error, 1, NULL, &data->o_errorcode, data->o_errormsg, sizeof(data->o_errormsg), OCI_HTYPE_ERROR);
-			ErrorMessage("ERROR database: oracle_error: %s\n", data->o_errormsg);
-			ErrorMessage("ERROR database: Checklist: check database is listed in tnsnames.ora\n");
-			ErrorMessage("ERROR database:            check tnsnames.ora readable\n");
-			ErrorMessage("ERROR database:            check database accessible with sqlplus\n");
-			FatalError("database OCILogon : Connection to database '%s' failed\n", data->dbRH[data->dbtype_id]->dbname);
-		}
-
-		if (OCIHandleAlloc(data->o_environment, (dvoid **)&data->o_statement, OCI_HTYPE_STMT, 0, NULL))
-		PRINT_ORACLE_ERR("OCIHandleAlloc (2)");
-		break;
-#endif
-
-#ifdef ENABLE_MSSQL
-
-		case DB_MSSQL:
-
-		CLEARSTATEMENT();
-		dberrhandle(mssql_err_handler);
-		dbmsghandle(mssql_msg_handler);
-
-		if( dbinit() != NULL )
-		{
-			data->ms_login = dblogin();
-			if( data->ms_login == NULL )
-			{
-				FatalError("database Failed to allocate login structure\n");
-			}
-			/* Set up some informational values which are stored with the connection */
-			DBSETLUSER (data->ms_login, data->user);
-			DBSETLPWD (data->ms_login, data->password);
-			DBSETLAPP (data->ms_login, "snort");
-
-			data->ms_dbproc = dbopen(data->ms_login, data->host);
-			if( data->ms_dbproc == NULL )
-			{
-				FatalError("database Failed to logon to host '%s'\n", data->host);
-			}
-			else
-			{
-				if( dbuse( data->ms_dbproc, data->dbRH[data->dbtype_id]->dbname ) != SUCCEED )
-				{
-					FatalError("database Unable to change context to database '%s'\n", data->dbRH[data->dbtype_id]->dbname);
-				}
-			}
-		}
-		else
-		{
-			FatalError("database Connection to database '%s' failed\n", data->dbRH[data->dbtype_id]->dbname);
-		}
-		CLEARSTATEMENT();
-		break;
-#endif
-
-	default:
-		FatalError(
-				"database [%s()]: Invoked with unknown database type [%u] \n",
-				__FUNCTION__, data->dbtype_id);
-
-		break;
-
-	}
-
-	return;
-
-}
-
-/*******************************************************************************
- * Function: Disconnect(DatabaseData * data)
- *
- * Purpose: Database independent function to close a connection
- *
- ******************************************************************************/
-void Disconnect(DatabaseData * data) {
-
-	if (data == NULL) {
-		FatalError("database [%s()]: Invoked with NULL data \n", __FUNCTION__);
-	}
-
-	LogMessage("database: Closing connection to database \"%s\"\n",
-			data->dbname);
-
-	switch (data->dbtype_id) {
-#ifdef ENABLE_POSTGRESQL
-	case DB_POSTGRESQL:
-
-	if(data->p_result)
-	{
-		PQclear(data->p_result);
-		data->p_result = NULL;
-	}
-
-	if(data->p_connection)
-	{
-		PQfinish(data->p_connection);
-		data->p_connection = NULL;
-	}
-	break;
-
-#endif
-
-#ifdef ENABLE_MYSQL
-	case DB_MYSQL:
-
-		if (data->m_result) {
-			mysql_free_result(data->m_result);
-			data->m_result = NULL;
-		}
-
-		if (data->m_sock) {
-			mysql_close(data->m_sock);
-			data->m_sock = NULL;
-		}
-
-		break;
-#endif
-
-#ifdef ENABLE_ODBC
-
-		case DB_ODBC:
-
-		if(data->u_handle)
-		{
-			SQLDisconnect(data->u_connection);
-			SQLFreeHandle(SQL_HANDLE_ENV, data->u_handle);
-		}
-		break;
-#endif
-
-#ifdef ENABLE_ORACLE
-		case DB_ORACLE:
-
-		if(data->o_servicecontext)
-		{
-			OCILogoff(data->o_servicecontext, data->o_error);
-			if(data->o_error)
-			{
-				OCIHandleFree((dvoid *)data->o_error, OCI_HTYPE_ERROR);
-			}
-			if(data->o_statement)
-			{
-				OCIHandleFree((dvoid *)data->o_statement, OCI_HTYPE_STMT);
-			}
-		}
-		break;
-#endif
-
-#ifdef ENABLE_MSSQL
-
-		case DB_MSSQL:
-
-		CLEARSTATEMENT();
-		if( data->ms_dbproc != NULL )
-		{
-			dbfreelogin(data->ms_login);
-			data->ms_login = NULL;
-			dbclose(data->ms_dbproc);
-			data->ms_dbproc = NULL;
-		}
-		break;
-#endif
-
-	default:
-		FatalError(
-				"database [%s()]: Invoked with unknown database type [%u] \n",
-				__FUNCTION__, data->dbtype_id);
-		break;
-
-	}
-
-	return;
-}
-
-void DatabasePrintUsage(void) {
-	puts("\nUSAGE: database plugin\n");
-
-	puts(
-			" output database: [log | alert], [type of database], [parameter list]\n");
-	puts(" [log | alert] selects whether the plugin will use the alert or");
-	puts(" log facility.\n");
-
-	puts(" For the first argument, you must supply the type of database.");
-	puts(" The possible values are mysql, postgresql, odbc, oracle and");
-	puts(" mssql ");
-
-	puts(" The parameter list consists of key value pairs. The proper");
-	puts(" format is a list of key=value pairs each separated a space.\n");
-
-	puts(" The only parameter that is absolutely necessary is \"dbname\".");
-	puts(" All other parameters are optional but may be necessary");
-	puts(" depending on how you have configured your RDBMS.\n");
-
-	puts(" dbname - the name of the database you are connecting to\n");
-
-	puts(" host - the host the RDBMS is on\n");
-
-	puts(" port - the port number the RDBMS is listening on\n");
-
-	puts(" user - connect to the database as this user\n");
-
-	puts(" password - the password for given user\n");
-
-	puts(
-			" sensor_name - specify your own name for this barnyard2 sensor. If you");
-	puts("        do not specify a name one will be generated automatically\n");
-
-	puts(" encoding - specify a data encoding type (hex, base64, or ascii)\n");
-
-	puts(" detail - specify a detail level (full or fast)\n");
-
-	puts(
-			" ignore_bpf - specify if you want to ignore the BPF part for a sensor\n");
-	puts("              definition (yes or no, no is default)\n");
-
-	puts(" FOR EXAMPLE:");
-	puts(" The configuration I am currently using is MySQL with the database");
-	puts(
-			" name of \"snort\". The user \"snortusr@localhost\" has INSERT and SELECT");
-	puts(
-			" privileges on the \"snort\" database and does not require a password.");
-	puts(" The following line enables barnyard2 to log to this database.\n");
-
-	puts(
-			" output database: log, mysql, dbname=snort user=snortusr host=localhost\n");
-}
-
 /* CHECKME: -elz This function is not complete ...alot of leaks could happen here! */
-void SpoDatabaseCleanExitFunction(int signal, void *arg) {
+void SpoDatabaseCleanExitFunction(int signal, void *arg)
+{
+    uint8_t i;
 	DatabaseData *data = (DatabaseData *) arg;
 
 	DEBUG_WRAP(DebugMessage(DB_DEBUG,"database(debug): entered SpoDatabaseCleanExitFunction\n"););
 
 	if (data != NULL) {
-		if (checkTransactionState(&data->dbRH[data->dbtype_id])) {
-			if (RollbackTransaction(data)) {
-				DEBUG_WRAP(DebugMessage(DB_DEBUG,"database: RollbackTransaction failed in [%s()] \n",
-								__FUNCTION__));
-			}
+	    for ( i=0; i<SQL_QUERY_SOCK_MAX; i++ ) {
+	        if (checkTransactionState(&data->m_dbins[i])) {
+	            if (RollbackTransaction(data, i)) {
+	                DEBUG_WRAP(DebugMessage(DB_DEBUG,"database: RollbackTransaction failed in [%s()] \n",
+	                                __FUNCTION__));
+	            }
+	        }
 
-		}
-
-		resetTransactionState(&data->dbRH[data->dbtype_id]);
+	        resetTransactionState(&data->m_dbins[i]);
+	    }
 
 		MasterCacheFlush(data, CACHE_FLUSH_ALL);
 
 		SQL_Finalize(data);
 
 		if (!(data->dbRH[data->dbtype_id].dbConnectionStatus(
-				&data->dbRH[data->dbtype_id]))) {
-			UpdateLastCid(data, 1, 1);
+				&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
+			UpdateLastCid(data, 1, 1, SPO_DB_DEF_INS);
 		}
 
-		Disconnect(data);
+        for ( i=0; i<SQL_QUERY_SOCK_MAX; i++ ) {
+            Disconnect(data, i);
 
-		if (data->SQL_INSERT != NULL) {
-			free(data->SQL_INSERT);
-			data->SQL_INSERT = NULL;
-		}
+            if (data->SQL_INSERT[i] != NULL) {
+                free(data->SQL_INSERT[i]);
+                data->SQL_INSERT[i] = NULL;
+            }
 
-		if (data->SQL_SELECT != NULL) {
-			free(data->SQL_SELECT);
-			data->SQL_SELECT = NULL;
-		}
+            if (data->SQL_SELECT[i] != NULL) {
+                free(data->SQL_SELECT[i]);
+                data->SQL_SELECT[i] = NULL;
+            }
+        }
 
 		free(data->args);
 		free(data);
@@ -5446,7 +4324,9 @@ void SpoDatabaseCleanExitFunction(int signal, void *arg) {
 }
 
 /* CHECKME: -elz This function is not complete ...alot of leaks could happen here! */
-void SpoDatabaseRestartFunction(int signal, void *arg) {
+void SpoDatabaseRestartFunction(int signal, void *arg)
+{
+    uint8_t i;
 	DatabaseData *data = (DatabaseData *) arg;
 
 	DEBUG_WRAP(DebugMessage(DB_DEBUG,"database(debug): entered SpoDatabaseRestartFunction\n"););
@@ -5454,11 +4334,13 @@ void SpoDatabaseRestartFunction(int signal, void *arg) {
 	if (data != NULL) {
 		MasterCacheFlush(data, CACHE_FLUSH_ALL);
 
-		resetTransactionState(&data->dbRH[data->dbtype_id]);
+		UpdateLastCid(data, 1, 1, SPO_DB_DEF_INS);
 
-		UpdateLastCid(data, 1, 1);
+        for ( i=0; i<SQL_QUERY_SOCK_MAX; i++ ) {
+            resetTransactionState(&data->m_dbins[i]);
+            Disconnect(data, i);
+        }
 
-		Disconnect(data);
 		free(data->args);
 		free(data);
 		data = NULL;
@@ -5534,675 +4416,3 @@ u_int32_t checkDatabaseType(DatabaseData *data) {
 
 	return 0;
 }
-
-void resetTransactionState(dbReliabilityHandle *pdbRH) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	pdbRH->checkTransaction = 0;
-	pdbRH->transactionCallFail = 0;
-
-	/* seem'ed to cause loop */
-	//pdbRH->transactionErrorCount = 0;
-	return;
-}
-
-void setTransactionState(dbReliabilityHandle *pdbRH) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	pdbRH->checkTransaction = 1;
-	return;
-}
-
-void setTransactionCallFail(dbReliabilityHandle *pdbRH)
-{
-	LogMessage( "%s: Rollback\n", __func__);
-
-	if ( pdbRH == NULL ) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	if ( pdbRH->checkTransaction ) {
-		pdbRH->transactionCallFail = 1;
-		pdbRH->transactionErrorCount++;
-	}
-
-	return;
-}
-
-u_int32_t getReconnectState(dbReliabilityHandle *pdbRH) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	return pdbRH->dbReconnectedInTransaction;
-}
-
-void setReconnectState(dbReliabilityHandle *pdbRH, u_int32_t reconnection_state) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	pdbRH->dbReconnectedInTransaction = reconnection_state;
-	return;
-}
-
-u_int32_t checkTransactionState(dbReliabilityHandle *pdbRH) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	return pdbRH->checkTransaction;
-}
-
-u_int32_t checkTransactionCall(dbReliabilityHandle *pdbRH) {
-	if (pdbRH == NULL) {
-		/* XXX */
-		FatalError("database [%s()] called with a null dbReliabilityHandle",
-				__FUNCTION__);
-	}
-
-	if (checkTransactionState(pdbRH)) {
-		return pdbRH->transactionCallFail;
-	}
-
-	return 0;
-}
-
-u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH)
-{
-	struct timespec sleepRet = { 0 };
-
-	if (pdbRH == NULL) {
-		return 1;
-	}
-
-	if (pdbRH->dbConnectionCount < pdbRH->dbConnectionLimit) {
-		pdbRH->dbConnectionCount++; /* Database Reconnected it seem... */
-
-		if (nanosleep(&pdbRH->dbReconnectSleepTime, &sleepRet) < 0) {
-			perror("dbReconnectSetCounter():");
-			LogMessage("[%s() ]Call to nanosleep(): Failed with [%u] seconds left and [%u] microsecond left \n",
-					__FUNCTION__, sleepRet.tv_sec, sleepRet.tv_nsec);
-			return 1;
-		}
-		return 0;
-	}
-
-	return 1;
-}
-
-u_int32_t dbReconnectReSetCounters(dbReliabilityHandle *pdbRH)
-{
-    if (pdbRH == NULL) {
-        return 1;
-    }
-
-    pdbRH->dbConnectionCount = 0;
-    return 0;
-}
-
-#ifdef ENABLE_MYSQL
-u_int32_t MYSQL_ManualConnect(DatabaseData *dbdata) {
-	if (dbdata == NULL) {
-		/* XXX */
-		return 1;
-	}
-
-	if (dbdata->m_sock != NULL) {
-		mysql_close(dbdata->m_sock);
-		dbdata->m_sock = NULL;
-	}
-
-	dbdata->m_sock = mysql_init(NULL);
-
-	if (dbdata->m_sock == NULL) {
-		FatalError("database Connection to database '%s' failed\n",
-				dbdata->dbname);
-	}
-
-	/* check if we want to connect with ssl options */
-	if (dbdata->use_ssl == 1) {
-		mysql_ssl_set(dbdata->m_sock, dbdata->dbRH[dbdata->dbtype_id].ssl_key,
-				dbdata->dbRH[dbdata->dbtype_id].ssl_cert,
-				dbdata->dbRH[dbdata->dbtype_id].ssl_ca,
-				dbdata->dbRH[dbdata->dbtype_id].ssl_ca_path,
-				dbdata->dbRH[dbdata->dbtype_id].ssl_cipher);
-	}
-
-	if (mysql_real_connect(dbdata->m_sock, dbdata->host, dbdata->user,
-			dbdata->password, dbdata->dbname,
-			dbdata->port == NULL ? 0 : atoi(dbdata->port), NULL, CLIENT_INTERACTIVE) == NULL) {
-		if (mysql_errno(dbdata->m_sock))
-			LogMessage("database: mysql_error: %s\n",
-					mysql_error(dbdata->m_sock));
-
-		LogMessage("database: Failed to logon to database '%s'\n",
-				dbdata->dbname);
-
-		mysql_close(dbdata->m_sock);
-		dbdata->m_sock = NULL;
-		return 1;
-	}
-
-	if (mysql_autocommit(dbdata->m_sock, 0)) {
-		/* XXX */
-		LogMessage("database Can't set autocommit off \n");
-		mysql_close(dbdata->m_sock);
-		dbdata->m_sock = NULL;
-		return 1;
-	}
-
-	/* We are in manual connect mode */
-	if (mysql_options(dbdata->m_sock, MYSQL_OPT_RECONNECT,
-			&dbdata->dbRH[dbdata->dbtype_id].mysql_reconnect) != 0) {
-		LogMessage("database: Failed to set reconnect option: %s\n",
-				mysql_error(dbdata->m_sock));
-		mysql_close(dbdata->m_sock);
-		dbdata->m_sock = NULL;
-		return 1;
-	}
-
-	/* Get the new thread id */
-	dbdata->dbRH[dbdata->dbtype_id].pThreadID = mysql_thread_id(dbdata->m_sock);
-
-	return 0;
-}
-
-u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH)
-{
-	unsigned long aThreadID = 0; /* after  mysql_ping call thread_id */
-	int ping_ret = 0;
-	DatabaseData *dbdata = NULL;
-
-	if ((pdbRH == NULL) || (pdbRH->dbdata == NULL)) {
-		return 1;
-	}
-
-	dbdata = pdbRH->dbdata;
-	if (dbdata->m_sock == NULL)
-		return 1;
-
-MYSQL_RetryConnection:
-	/* mysql_ping() could reconnect and we wouldn't know */
-	aThreadID = mysql_thread_id(pdbRH->dbdata->m_sock);
-	ping_ret = mysql_ping(pdbRH->dbdata->m_sock);
-
-	/* We might try to recover from this */
-	if (pdbRH->mysql_reconnect) {
-		switch (ping_ret) {
-		case 0:
-			if (aThreadID != pdbRH->pThreadID) {
-				/* mysql ping reconnected,
-				 we need to check if we are in a transaction
-				 and if we are we bail, since the resulting issued commands would obviously fail
-				 */
-				if (dbReconnectSetCounters(pdbRH)) {
-					FatalError("database [%s()]: Too much reconnection, "
-					        "the process will need to be restarted \n",
-							__FUNCTION__);
-				}
-
-				if (checkTransactionState(pdbRH)) {
-					/* ResetState for the caller */
-					setReconnectState(pdbRH, 1);
-					setTransactionCallFail(pdbRH);
-					setTransactionState(pdbRH);
-				}
-
-				pdbRH->pThreadID = aThreadID;
-
-				/* make sure are are off auto_commit */
-				if (mysql_autocommit(pdbRH->dbdata->m_sock, 0)) {
-					LogMessage("database Can't set autocommit off \n");
-					return 1;
-				}
-
-				/* make shure we keep the option on ..*/
-				if (mysql_options(dbdata->m_sock, MYSQL_OPT_RECONNECT,
-						&pdbRH->mysql_reconnect) != 0) {
-					LogMessage("database: Failed to set reconnect option: %s\n",
-							mysql_error(dbdata->m_sock));
-					return 1;
-				}
-
-				LogMessage("Warning: {MYSQL} The database connection has reconnected"
-				        " it self to the database server, via a call to mysql_ping() new thread id is [%u] \n",
-						pdbRH->pThreadID);
-				return 0;
-			} else {
-				/* Safety */
-				pdbRH->pThreadID = aThreadID;
-
-				/*
-				 make sure are are off auto_commit, since we are in auto_commit and mysql doc is not clear if
-				 by using automatic reconnect we keep connection attribute, i just force them, since we do not call
-				 MYSQL_ManualConnect
-				 */
-
-				if (mysql_autocommit(pdbRH->dbdata->m_sock, 0)) {
-					LogMessage("database Can't set autocommit off \n");
-					return 1;
-				}
-
-				/* make shure we keep the option on ..*/
-				if (mysql_options(dbdata->m_sock, MYSQL_OPT_RECONNECT,
-						&pdbRH->mysql_reconnect) != 0) {
-					LogMessage("%s: Failed to set reconnect option: %s\n",
-							__func__, mysql_error(dbdata->m_sock));
-					return 1;
-				}
-				return 0;
-			}
-			break;
-		case CR_COMMANDS_OUT_OF_SYNC:
-		case CR_SERVER_GONE_ERROR:
-		case CR_UNKNOWN_ERROR:
-		default:
-			if (checkTransactionState(pdbRH)) {
-				/* ResetState for the caller */
-			    LogMessage("%s: reconnect, setTransactionCallFail"
-			            ", ping_ret %d\n", __func__, ping_ret);
-				setReconnectState(pdbRH, 1);
-				setTransactionCallFail(pdbRH);
-				setTransactionState(pdbRH);
-			}
-
-			if (dbReconnectSetCounters(pdbRH)) {
-				FatalError("database [%s()]: Too much reconnection, "
-				        "the process will need to be restarted \n",
-						__FUNCTION__);
-			}
-
-			goto MYSQL_RetryConnection;
-			break;
-		}
-	}
-	else{    /* Manual Reconnect mode */
-		switch (ping_ret) {
-		case 0:
-			if (aThreadID != pdbRH->pThreadID) {
-				FatalError("database We are in {MYSQL} \"manual reconnect\" mode "
-				        "and a call to mysql_ping() changed the mysql_thread_id, "
-				        "this shouldn't happen the process will terminate \n");
-			}
-			break;
-		case CR_COMMANDS_OUT_OF_SYNC:
-		case CR_SERVER_GONE_ERROR:
-		case CR_UNKNOWN_ERROR:
-		default:
-			if (checkTransactionState(pdbRH)) {
-				/* ResetState for the caller */
-			    LogMessage("%s: no_reconnect(no setTransactionCallFail)"
-			            ", ping_ret %d\n", __func__, ping_ret);
-			    setReconnectState(pdbRH, 1);
-			    //setTransactionCallFail(pdbRH);
-			    setTransactionState(pdbRH);
-			}
-
-			if (dbReconnectSetCounters(pdbRH)) {
-				FatalError("database [%s()]: Too much reconnection, "
-				        "the process will need to be restarted \n",
-						__FUNCTION__);
-			}
-
-			if ((MYSQL_ManualConnect(pdbRH->dbdata))) {
-				goto MYSQL_RetryConnection;
-			}
-
-			dbReconnectReSetCounters(pdbRH);
-			break;
-		}
-		return 0;
-	}
-
-	LogMessage("[%s()], Reached a point of no return ...it shouldn't happen \n",
-			__FUNCTION__);
-	return 1;
-}
-#endif
-
-#ifdef ENABLE_ODBC
-u_int32_t dbConnectionStatusODBC(dbReliabilityHandle *pdbRH)
-{
-	DatabaseData *data = NULL;
-	u_int32_t StateFail = 0;
-	ODBC_SQLRETURN ret;
-	ODBC_SQLCHAR sqlState[6];
-	ODBC_SQLCHAR msg[SQL_MAX_MESSAGE_LENGTH] = {0};
-	SQLINTEGER nativeError;
-	SQLSMALLINT errorIndex = 1;
-	SQLSMALLINT msgLen;
-
-	//DEBUGGGGGGGGGGGGGGGGGGG
-	return 0;
-	//DEBUGGGGGGGGGGGGGGGGGGG
-
-	if( (pdbRH == NULL) ||
-			(pdbRH->dbdata == NULL))
-	{
-		/* XXX */
-		return 1;
-	}
-	data = pdbRH->dbdata;
-
-	if(data->u_connection != NULL)
-	{
-		while ( (ret = SQLGetDiagRec( SQL_HANDLE_DBC
-								, data->u_connection
-								, errorIndex
-								, sqlState
-								, &nativeError
-								, msg
-								, SQL_MAX_MESSAGE_LENGTH
-								, &msgLen)) == SQL_SUCCESS)
-		{
-			if(StateFail == 0)
-			{
-				/* Destroy the statement handle */
-				if(data->u_statement != NULL)
-				{
-					SQLFreeHandle(SQL_HANDLE_STMT,data->u_statement);
-				}
-
-				if(data->u_connection != NULL)
-				{
-					SQLFreeHandle(SQL_HANDLE_DBC,data->u_connection);
-				}
-
-				if(data->u_handle != NULL)
-				{
-					SQLFreeHandle(SQL_HANDLE_ENV,data->u_statement);
-				}
-
-				if(checkTransactionState(pdbRH))
-				{
-					/* ResetState for the caller */
-					setReconnectState(pdbRH,1);
-					setTransactionCallFail(pdbRH);
-					setTransactionState(pdbRH);
-				}
-				StateFail = 1;
-
-				if(!(SQLAllocEnv(&data->u_handle) == SQL_SUCCESS))
-				{
-					FatalError("database unable to allocate ODBC environment\n");
-				}
-
-				if(!(SQLAllocConnect(data->u_handle, &data->u_connection) == SQL_SUCCESS))
-				{
-					FatalError("database unable to allocate ODBC connection handle\n");
-				}
-
-				/* The SQL Server ODBC driver always returns SQL_SUCCESS_WITH_INFO
-				 * on a successful SQLConnect, SQLDriverConnect, or SQLBrowseConnect.
-				 * When an ODBC application calls SQLGetDiagRec after getting
-				 * SQL_SUCCESS_WITH_INFO, it can receive the following messages:
-				 * 5701 - Indicates that SQL Server put the user's context into the
-				 *        default database defined in the data source, or into the
-				 *        default database defined for the login ID used in the
-				 *        connection if the data source did not have a default database.
-				 * 5703 - Indicates the language being used on the server.
-				 * You can ignore messages 5701 and 5703; they are only informational.
-				 */
-				ret = SQLConnect( data->u_connection
-						, (ODBC_SQLCHAR *)data->dbname
-						, SQL_NTS
-						, (ODBC_SQLCHAR *)data->user
-						, SQL_NTS
-						, (ODBC_SQLCHAR *)data->password
-						, SQL_NTS);
-
-				if( (ret != SQL_SUCCESS) &&
-						(ret != SQL_SUCCESS_WITH_INFO))
-				{
-					ODBCPrintError(data,SQL_HANDLE_DBC);
-					FatalError("database ODBC unable to connect.\n");
-				}
-			}
-		}
-	}
-
-	return 0;
-
-}
-#endif  /* ENABLE_ODBC */
-
-#ifdef ENABLE_POSTGRESQL
-u_int32_t dbConnectionStatusPOSTGRESQL(dbReliabilityHandle *pdbRH)
-{
-	DatabaseData *data = NULL;
-
-	int PQpingRet = 0;
-
-	if( (pdbRH == NULL) ||
-			(pdbRH->dbdata == NULL))
-	{
-		/* XXX */
-		return 1;
-	}
-
-	data = pdbRH->dbdata;
-
-	conn_test:
-	if(data->p_connection != NULL)
-	{
-
-#ifdef HAVE_PQPING
-		switch( (PQpingRet = PQping(data->p_pingString)))
-		{
-			case PQPING_OK:
-			break;
-
-			case PQPING_NO_ATTEMPT:
-			LogMessage("[%s()], PQPing call assumed [PQPING_NO_ATTEMPT] using connection string [%s], continuing \n",
-					__FUNCTION__,
-					data->p_pingString);
-			break;
-
-			case PQPING_REJECT:
-			case PQPING_NO_RESPONSE:
-			default:
-
-			LogMessage("[%s()], PQPing call retval[%d] seem's to indicate unreacheable server, assuming connection is dead \n",
-					__FUNCTION__,
-					PQpingRet);
-
-			if(checkTransactionState(pdbRH))
-			{
-				/* ResetState for the caller */
-				setReconnectState(pdbRH,1);
-				setTransactionCallFail(pdbRH);
-				setTransactionState(pdbRH);
-			}
-
-			if(data->p_connection)
-			{
-				PQfinish(data->p_connection);
-				data->p_connection = NULL;
-			}
-			break;
-		}
-#endif
-
-		switch(PQstatus(data->p_connection))
-		{
-			case CONNECTION_OK:
-			return 0;
-			break;
-
-			case CONNECTION_BAD:
-			default:
-
-			if(checkTransactionState(pdbRH))
-			{
-				/* ResetState for the caller */
-				setReconnectState(pdbRH,1);
-				setTransactionCallFail(pdbRH);
-				setTransactionState(pdbRH);
-			}
-
-			failed_pqcon:
-			if(dbReconnectSetCounters(pdbRH))
-			{
-				/* XXX */
-				FatalError("database [%s()]: Call failed, the process will need to be restarted \n",__FUNCTION__);
-			}
-
-			/* Changed PQreset by call to PQfinish and PQdbLogin */
-			if(data->p_connection)
-			{
-				PQfinish(data->p_connection);
-				data->p_connection = NULL;
-			}
-
-			if (data->use_ssl == 1)
-			{
-				if( (data->p_connection =
-								PQsetdbLogin(data->host,
-										data->port,
-										data->dbRH[data->dbtype_id].ssl_mode,
-										NULL,
-										data->dbname,
-										data->user,
-										data->password)) == NULL)
-				{
-					goto failed_pqcon;
-				}
-			}
-			else
-			{
-				if( (data->p_connection =
-								PQsetdbLogin(data->host,
-										data->port,
-										NULL,
-										NULL,
-										data->dbname,
-										data->user,
-										data->password)) == NULL)
-				{
-					goto failed_pqcon;
-				}
-			}
-
-			goto conn_test;
-			break;
-		}
-
-	}
-	else
-	{
-		/* XXX */
-		setTransactionCallFail(pdbRH);
-		setTransactionState(pdbRH);
-		return 1;
-	}
-
-	return 0;
-}
-#endif
-
-#ifdef ENABLE_ORACLE
-u_int32_t dbConnectionStatusORACLE(dbReliabilityHandle *pdbRH)
-{
-	if( (pdbRH == NULL) ||
-			(pdbRH->dbdata == NULL))
-	{
-		/* XXX */
-		return 1;
-	}
-
-	return 0;
-}
-#endif
-
-#ifdef ENABLE_MSSQL
-u_int32_t dbConnectionStatusMSSQL(struct dbReliabilityHandle *pdbRH);
-{
-	if( (pdbRH == NULL) ||
-			(pdbRH->dbdata == NULL))
-	{
-		/* XXX */
-		return 1;
-	}
-
-	return 0;
-}
-#endif
-
-#ifdef ENABLE_ODBC
-void ODBCPrintError(DatabaseData *data,SQLSMALLINT iHandleType)
-{
-	ODBC_SQLRETURN ret;
-	ODBC_SQLCHAR sqlState[6];
-	ODBC_SQLCHAR msg[SQL_MAX_MESSAGE_LENGTH];
-	SQLINTEGER nativeError;
-	SQLSMALLINT errorIndex = 1;
-	SQLSMALLINT msgLen;
-
-	void * selected_handle;
-
-	if(data == NULL)
-	{
-		/* XXX */
-		return;
-	}
-
-	switch(iHandleType)
-	{
-
-		case SQL_HANDLE_DBC:
-		selected_handle = data->u_connection;
-		break;
-
-		case SQL_HANDLE_STMT:
-		selected_handle = data->u_statement;
-		break;
-
-		default:
-		LogMessage("Database [%s()]: Unknown statement type [%u] \n",
-				__FUNCTION__,
-				iHandleType);
-		return;
-		break;
-	}
-
-	/* assume no errror unless nativeError tells us otherwise */
-	while ( (ret = SQLGetDiagRec( iHandleType
-							, selected_handle
-							, errorIndex
-							, sqlState
-							, &nativeError
-							, msg
-							, SQL_MAX_MESSAGE_LENGTH
-							, &msgLen)) == SQL_SUCCESS)
-	{
-		ErrorMessage("[%s()]: Error Index [%u] Error Message [%s] \n",
-				__FUNCTION__,
-				errorIndex,
-				msg);
-
-		DEBUG_WRAP(LogMessage("database: %s\n", msg););
-		errorIndex++;
-	}
-
-	return;
-}
-#endif /* ENABLE_ODBC */
-
-/* Database Reliability */

@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#define __USE_GNU
 #include <pthread.h>
 #include <signal.h>
 
@@ -49,6 +50,7 @@ by_mul_tread_para bmt_para;
 pthread_t tid_i[BY_MUL_TR_DEFAULT];
 pthread_t tid_w[BY_MUL_TR_DEFAULT];
 pthread_t tid_o[1];
+EventRingTopOcts event_rto;
 
 /*
  ** PRIVATE FUNCTIONS
@@ -464,9 +466,9 @@ int spoolerReadRecord(Spooler *spooler)
         spooler->state = SPOOLER_RECORD_READ;
         spooler->record_idx++;
 
-        spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].record_idx =
+        spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].record_idx =
                 spooler->record_idx;
-        spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].timestamp =
+        spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].timestamp =
                 spooler->timestamp;
     }
 
@@ -791,10 +793,22 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
     return ret;
 #else
 
+    cpu_set_t cpuset, cpuset_o;
+
     if ( !bc->trbit_valid ){
         LogMessage("%s: no valid thread read path configured, exit\n", __func__);
         return 0;
     }
+
+    //Nice Value
+    errno = 0;
+    err = nice(-6);
+    if (-1==err && 0!=errno) {
+        LogMessage("Can't set nice value: [%s]\n", strerror(errno));
+    }
+
+    CPU_ZERO(&cpuset);
+    CPU_ZERO(&cpuset_o);
 
     memset(&bmt_para, 0, sizeof(bmt_para));
 
@@ -855,6 +869,19 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
             LogMessage("Can't create watch thread %d: [%s]\n", i, strerror(err));
             goto pexit;
         }
+
+        if ( bc->tr_lcore[i] ) {
+            //Set affinity to Logs Read Threads
+            LogMessage("%s: set cpuset 0x%lx\n", __func__, bc->tr_lcore[i]);
+            cpuset.__bits[0] = bc->tr_lcore[i];
+            cpuset_o.__bits[0] |= bc->tr_lcore[i];
+            err = pthread_setaffinity_np(tid_i[i], sizeof(cpu_set_t), &cpuset);
+            if ( 0 != err )
+                handle_error_en(err, "pthread_setaffinity_np");
+            err = pthread_setaffinity_np(tid_w[i], sizeof(cpu_set_t), &cpuset);
+            if ( 0 != err )
+                handle_error_en(err, "pthread_setaffinity_np");
+        }
     }
 
     /* NOTE: This "i" is following previous state */
@@ -865,6 +892,14 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
         goto pexit;
     }
 
+    if ( cpuset_o.__bits[0] ) {
+        //Set affinity to Logs Dispatch Thread
+        err = pthread_setaffinity_np(tid_o[0], sizeof(cpu_set_t), &cpuset_o);
+        if ( 0 != err )
+            handle_error_en(err, "pthread_setaffinity_np");
+    }
+
+    //Thread Join
     ptid = tid_o;
     for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
         if ( !(bmt_para.trbit_valid&(0x01<<i)) )
@@ -915,7 +950,7 @@ void spoolerProcessRecord(Spooler *spooler, int fire_output)
     uint32_t event_id, event_second;
 
     /* convert type once */
-    type = ntohl(((Unified2RecordHeader *) spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].header)->type);
+    type = ntohl(((Unified2RecordHeader *) spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].header)->type);
 
     /* increment the stats */
     pc.total_records++;
@@ -939,7 +974,7 @@ void spoolerProcessRecord(Spooler *spooler, int fire_output)
 #ifndef SPOOLER_FIXED_BUF
     pCurData = spooler->record.data;
 #else
-    pCurData = spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].data;
+    pCurData = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].data;
 #endif
     event_id = 0x0000ffff & ntohl(((Unified2CacheCommon *) pCurData)->event_id);
     event_second = ntohl(((Unified2CacheCommon *) pCurData)->event_second);
@@ -1267,6 +1302,7 @@ void* spoolerRecordRead_T(void * arg)
     u_int32_t waldo_timestamp;
     sigset_t set;
     spooler_r_para *sr_para = (spooler_r_para*) arg;
+    EventRecordNode *ernCache;
     //uint32_t ws_idx = 0;
 
     sigemptyset(&set);
@@ -1364,10 +1400,16 @@ void* spoolerRecordRead_T(void * arg)
         switch(read_rtn) {
         case BARNYARD2_SUCCESS: /* check for a successful record read */
             spooler->record_idx++;
+            ernCache = &(sr_para->sring->event_cache[sr_para->sring->event_prod]);
+/*
             sr_para->sring->event_cache[sr_para->sring->event_cur].record_idx =
                     spooler->record_idx;
             sr_para->sring->event_cache[sr_para->sring->event_cur].timestamp =
                     spooler->timestamp;
+                    */
+
+            ernCache->record_idx = spooler->record_idx;
+            ernCache->timestamp = spooler->timestamp;
 
             if (spooler->skip_offset > 0) { /* skip this record */
             	DEBUG_WRAP(DebugMessage(DEBUG_SPOOLER, "Skipping due to record start offset (%lu)...\n",
@@ -1377,7 +1419,8 @@ void* spoolerRecordRead_T(void * arg)
             		sr_para->sring->r_switch = RING_PRE_ON;
             		spooler->state = SPOOLER_RECORD_SKIP_DONE;
             	}
-            } else {
+            }
+            else if ( UNIFIED2_INVALID_REC != ernCache->type ){
                 DEBUG_U_WRAP(LogMessage("%s: Process record, idx: %d\n", __func__, spooler->record_idx));
                 SPOOLER_RING_INC(sr_para);
             }
@@ -1455,22 +1498,72 @@ Packet * spoolerRetrievePktData(Packet *sp_pkt, uint8_t *pPktData)
 }
 
 /*
+ * */
+void spoolerRingTopSave(by_mul_tread_para *pbmt_para, RingTopOct *ele_rt)
+{
+    uint8_t i;
+
+    for ( i=0; i<BY_MUL_TR_DEFAULT; i++ ) {
+        if ( pbmt_para->trbit_valid & (0x01<<i) ) {
+            DEBUG_U_WRAP_DEEP(LogMessage("%s: save ring[%d] top %d, ele_rt %d\n", __func__,
+                    i, pbmt_para->s_para[i].sring->event_top,
+                    ele_rt->r_id));
+            ele_rt->r_top[i] = pbmt_para->s_para[i].sring->event_top;
+        }
+    }
+    ele_rt->r_flag = 1;
+}
+
+/*
+ * */
+void spoolerRingTopSync(by_mul_tread_para *pbmt_para, EventRingTopOcts *ele_rto)
+{
+    uint8_t i;
+    uint8_t sync = 0, mque_fi_prev = 0;
+
+    while ( ele_rto->mque_fo != ele_rto->mque_fi ) {
+        if ( 1 == ele_rto->rings2mque[ele_rto->mque_fo].r_flag ) {
+            //Keep producer and exit
+            break;
+        }
+
+        //Proceed To Next
+        mque_fi_prev = ele_rto->mque_fo;
+        ele_rto->mque_fo = SPOOLER_ELEQUE_RTO_PLUS_ONE(ele_rto->mque_fo);
+        sync = 1;
+    }
+
+    if ( sync ) {
+        for ( i=0; i<BY_MUL_TR_DEFAULT; i++ ) {
+            if ( pbmt_para->trbit_valid & (0x01<<i) ) {
+                pbmt_para->s_para[i].sring->event_coms = ele_rto->rings2mque[mque_fi_prev].r_top[i];
+                DEBUG_U_WRAP_DEEP(LogMessage("%s: proceed ring[%d] coms %d, ele_rt %d\n", __func__,
+                        i, pbmt_para->s_para[i].sring->event_coms,
+                        ele_rto->rings2mque[mque_fi_prev].r_id));
+            }
+        }
+    }
+}
+
+/*
+ * */
+void spoolerRingTopReset(EventRingTopOcts *ele_rto)
+{
+    memset(ele_rto, 0, sizeof(EventRingTopOcts));
+}
+
+/*
  ** RECORD PROCESSING EVENTS, as thread
  */
 void* spoolerRecordOutput_T(void * arg) //, int fire_output)
 {
-    uint32_t type;
-/*    EventRecordNode *ernCache;
-    EventRecordNode *ernxCache;*/
-    uint32_t cur_event_cnt = 0;
-    EventEP enCaChe;
-/*    uint8_t *pPktData = NULL;
-    uint8_t *pEventData = NULL;
-    uint32_t event_id, event_second;
-    uint32_t pevent_id, pevent_second;*/
+    uint8_t pbmt_idx = 0, mque_fi_next, i;
     uint16_t pktpos;
-    OutputType opt;
+    uint32_t type;
+    uint32_t cur_event_cnt = 0;
     uint32_t record_idx; // current record number
+    EventEP enCaChe;
+    OutputType opt;
 #ifdef BY_FAKE_DATA_RE_CNT
     uint32_t repeat_cnt[BY_MUL_TR_DEFAULT];
 #endif
@@ -1478,7 +1571,6 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
     us_cid_t cur_eventid[BY_MUL_TR_DEFAULT];
 
     sigset_t s_set;
-    uint8_t pbmt_idx = 0;
     spooler_r_para *sr_para;
     by_mul_tread_para *pbmt_para = (by_mul_tread_para *) arg;
     struct timespec t_elapse;
@@ -1493,6 +1585,8 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
     nanosleep(&t_elapse, NULL);   //switch to read threads
 
     memset(cur_eventid, 0, sizeof(cur_eventid));
+    spoolerRingTopReset(&event_rto);
+
 #ifdef BY_FAKE_DATA_RE_CNT
     memset(repeat_cnt, 0, sizeof(repeat_cnt));
 #endif
@@ -1512,7 +1606,14 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
                     sr_para->sring->r_flag = 0;
                     sr_para->sring->o_sleep_cnt = 0;
                     CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, NULL, UNIFIED2_IDS_FLUSH_OUT);
-                    sr_para->sring->event_coms = sr_para->sring->event_top;
+                    //sr_para->sring->event_coms = sr_para->sring->event_top;
+                    for ( i=0; i<BY_MUL_TR_DEFAULT; i++ ) {
+                        if ( pbmt_para->trbit_valid & (0x01<<i) ) {
+                            pbmt_para->s_para[i].sring->event_coms = pbmt_para->s_para[i].sring->event_top;
+                        }
+                    }
+                    spoolerRingTopReset(&event_rto);
+
                     cur_event_cnt = 0;
 
                     ret_mcid.rid = sr_para->rid;
@@ -1525,10 +1626,29 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
         }
 
         if ( cur_event_cnt >= 800 ) {
-        	CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, NULL, UNIFIED2_IDS_FLUSH);
-        	//SPOOLER_RING_COMS_N_DEC(sr_para, cur_event_cnt);
-        	sr_para->sring->event_coms = sr_para->sring->event_top;
-        	cur_event_cnt = 0;
+            event_rto.rings2mque[event_rto.mque_fi].r_id = event_rto.mque_fi;
+            spoolerRingTopSave(pbmt_para, &(event_rto.rings2mque[event_rto.mque_fi]));
+            CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, &(event_rto.rings2mque[event_rto.mque_fi]), UNIFIED2_IDS_FLUSH);
+            //If mque is all used
+            mque_fi_next = SPOOLER_ELEQUE_RTO_PLUS_ONE(event_rto.mque_fi);
+            do {
+                if ( mque_fi_next == event_rto.mque_fo ) {
+                    spoolerRingTopSync(pbmt_para, &event_rto);
+                    nanosleep(&t_elapse, NULL);
+                }
+                else {
+                    event_rto.mque_fi = mque_fi_next;
+                    spoolerRingTopSync(pbmt_para, &event_rto);
+                    break;
+                }
+            } while ( 1 );
+
+            //SPOOLER_RING_COMS_N_DEC(sr_para, cur_event_cnt);
+            //sr_para->sring->event_coms = sr_para->sring->event_top;
+            cur_event_cnt = 0;
+        }
+        else {
+            spoolerRingTopSync(pbmt_para, &event_rto);
         }
 
         sr_para->sring->r_flag = 1;
@@ -1725,7 +1845,7 @@ int spoolerEventCachePush(Spooler *spooler, uint32_t type, void *data,
         LogMessage("ERROR: Event RING buffer is full!\n");
         return -1;
     }
-    ernNode = &(spooler->spara->sring->event_cache[spooler->spara->sring->event_cur]);
+    ernNode = &(spooler->spara->sring->event_cache[spooler->spara->sring->event_prod]);
 #endif
 
     /* create the new node */
@@ -1767,7 +1887,7 @@ EventRecordNode *spoolerEventCacheGetByEventID(Spooler *spooler,
         return NULL;
 
     ernCur = spooler->spara->sring->event_top;
-    while (ernCur != spooler->spara->sring->event_cur) {
+    while (ernCur != spooler->spara->sring->event_prod) {
         ernCurrent = &(spooler->spara->sring->event_cache[ernCur]);
 #endif
         if ((ernCurrent->event_id == event_id)

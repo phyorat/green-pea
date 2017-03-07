@@ -29,6 +29,7 @@
  *
  */
 
+#include "jhash.h"
 #include "output-plugins/spo_database.h"
 #include "output-plugins/spo_database_cache.h"
 
@@ -69,9 +70,7 @@ u_int32_t ClassificationCacheSynchronize(DatabaseData *data,
 /* CLASSIFICATION FUNCTIONS */
 
 /* SIGNATURE FUNCTIONS */
-u_int32_t SignaturePopulateDatabase(DatabaseData *data,
-		cacheSignatureObj *cacheHead, int inTransac);
-u_int32_t SignatureCacheUpdateDBid(dbSignatureObj *iDBList,
+u_int32_t SignatureCacheUpdateDBid(DatabaseData *data, dbSignatureObj *iDBList,
 		u_int32_t array_length, cacheSignatureObj **cacheHead);
 u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 		u_int32_t *array_length);
@@ -224,7 +223,7 @@ u_int32_t cacheEventSignatureLookup(cacheSignatureObj *iHead,
 			}
 		}
 
-		iHead = iHead->next;
+		iHead = iHead->next_ham;
 	}
 
 	return matchCount;
@@ -750,7 +749,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 					SYSTEM_NAME_LEN);
 			sys_LobjNode.ref_system_name[SYSTEM_NAME_LEN - 1] = '\0'; //safety
 
-			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_name,
+			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_name, data->sanitize_buffer[0],
 					SYSTEM_NAME_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -765,7 +764,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 					SYSTEM_URL_LEN);
 			sys_LobjNode.ref_system_url[SYSTEM_URL_LEN - 1] = '\0'; //safety
 
-			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_url,
+			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_url, data->sanitize_buffer[0],
 					SYSTEM_URL_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -803,8 +802,8 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 			strncpy(ref_LobjNode.ref_tag, cNode->id, REF_TAG_LEN);
 			ref_LobjNode.ref_tag[REF_TAG_LEN - 1] = '\0'; //safety
 
-			if ((snort_escape_string_STATIC(ref_LobjNode.ref_tag, REF_TAG_LEN,
-					data))) {
+			if ((snort_escape_string_STATIC(ref_LobjNode.ref_tag, data->sanitize_buffer[0],
+			        REF_TAG_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
 								"[%s], Exiting. \n", __FUNCTION__,
@@ -875,18 +874,17 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
  call to ConvertSignatureCache()
  */
 
-u_int32_t SignatureCacheInsertObj(dbSignatureObj *iSigObj,
-		MasterCache *iMasterCache, u_int32_t from) {
+cacheSignatureObj* SignatureCacheInsertObj(dbSignatureObj *iSigObj,
+		MasterCache *iMasterCache, u_int32_t from, uint32_t ha_idx)
+{
 	cacheSignatureObj *TobjNode = NULL;
 
 	if ((iMasterCache == NULL) || (iSigObj == NULL)) {
-		/* XXX */
-		return 1;
+		return NULL;
 	}
 
 	if ((TobjNode = SnortAlloc(sizeof(cacheSignatureObj))) == NULL) {
-		/* XXX */
-		return 1;
+		return NULL;
 	}
 
 	memcpy(&TobjNode->obj, iSigObj, sizeof(dbSignatureObj));
@@ -902,7 +900,11 @@ u_int32_t SignatureCacheInsertObj(dbSignatureObj *iSigObj,
 	TobjNode->next = iMasterCache->cacheSignatureHead;
 	iMasterCache->cacheSignatureHead = TobjNode;
 
-	return 0;
+	//Hash Map
+	TobjNode->next_ham = iMasterCache->cacheSigHashMap[ha_idx];
+	iMasterCache->cacheSigHashMap[ha_idx] = TobjNode;
+
+	return TobjNode;
 }
 
 /** 
@@ -916,10 +918,13 @@ u_int32_t SignatureCacheInsertObj(dbSignatureObj *iSigObj,
  * 1 ERROR
  */
 u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
-		DatabaseData *data) {
+		DatabaseData *data)
+{
 	SigNode *cNode = NULL;
 	cacheSignatureObj *TobjNode = NULL;
 	dbSignatureObj lookupNode = { 0 };
+	dbSignatureHashKey sigHashKey;
+	uint32_t ha_idx;
 
 	if ((iHead == NULL) || (iMasterCache == NULL) || (data == NULL)) {
 		/* XXX */
@@ -945,8 +950,8 @@ u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
 			strncpy(lookupNode.message, cNode->msg, SIG_MSG_LEN);
 			lookupNode.message[SIG_MSG_LEN - 1] = '\0'; //safety
 
-			if ((snort_escape_string_STATIC(lookupNode.message, SIG_MSG_LEN,
-					data))) {
+			if ((snort_escape_string_STATIC(lookupNode.message, data->sanitize_buffer[0],
+			        SIG_MSG_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
 								"[%s], Exiting. \n", __FUNCTION__,
@@ -972,6 +977,14 @@ u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
 
 			TobjNode->next = iMasterCache->cacheSignatureHead;
 			iMasterCache->cacheSignatureHead = TobjNode;
+
+			sigHashKey.gid = TobjNode->obj.gid;
+			sigHashKey.sid = TobjNode->obj.sid;
+			ha_idx = jhash(&sigHashKey, sizeof(sigHashKey), 0) & SIG_HASHSZ_MASK;
+
+			//Hash Map
+			TobjNode->next_ham = iMasterCache->cacheSigHashMap[ha_idx];
+			iMasterCache->cacheSigHashMap[ha_idx] = TobjNode;
 
 			if (cNode->refs != NULL) {
 				if ((ConvertReferenceCache(cNode->refs, iMasterCache, TobjNode,
@@ -1047,7 +1060,7 @@ u_int32_t ConvertClassificationCache(ClassType **iHead,
 			strncpy(LobjNode.obj.sig_class_name, cNode->type, CLASS_NAME_LEN);
 			LobjNode.obj.sig_class_name[CLASS_NAME_LEN - 1] = '\0'; //safety.
 
-			if ((snort_escape_string_STATIC(LobjNode.obj.sig_class_name,
+			if ((snort_escape_string_STATIC(LobjNode.obj.sig_class_name, data->sanitize_buffer[0],
 					CLASS_NAME_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -1132,26 +1145,24 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+	if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 	SQL_SELECT_ALL_CLASSIFICATION) != SNORT_SNPRINTF_SUCCESS)) {
 		FatalError(
 				"database [%s()], Unable to allocate memory for query, bailing ...\n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
-		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
 	switch (data->dbtype_id) {
@@ -1160,12 +1171,13 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 
 	case DB_MYSQL:
 
-		result = mysql_query(data->m_sock, data->SQL_SELECT);
+		result = mysql_query(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->SQL_SELECT[SPO_DB_DEF_INS]);
 
 		switch (result) {
 		case 0:
 
-			if ((data->m_result = mysql_store_result(data->m_sock)) == NULL) {
+			if ((data->m_dbins[SPO_DB_DEF_INS].m_result
+			        = mysql_store_result(data->m_dbins[SPO_DB_DEF_INS].m_sock)) == NULL) {
 				/* XXX */
 				LogMessage("[%s()], Failed call to mysql_store_result \n",
 						__FUNCTION__);
@@ -1176,11 +1188,11 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 				my_ulonglong num_row = 0;
 				unsigned int i = 0;
 
-				if ((num_row = mysql_num_rows(data->m_result)) > 0) {
+				if ((num_row = mysql_num_rows(data->m_dbins[SPO_DB_DEF_INS].m_result)) > 0) {
 					if ((*iArrayPtr = SnortAlloc(
 							(sizeof(dbClassificationObj) * num_row))) == NULL) {
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
+						mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+						data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 						FatalError(
 								"database [%s()]: Failed call to sigCacheRawAlloc() \n",
 								__FUNCTION__);
@@ -1192,8 +1204,8 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 						free(*iArrayPtr);
 						*iArrayPtr = NULL;
 					}
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()]: No Classification found in database ... \n",
 							__FUNCTION__);
@@ -1202,14 +1214,14 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 
 				*array_length = num_row;
 
-				queryColCount = mysql_num_fields(data->m_result);
+				queryColCount = mysql_num_fields(data->m_dbins[SPO_DB_DEF_INS].m_result);
 
 				if (queryColCount != NUM_ROW_CLASSIFICATION) {
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()] To many column returned by query [%u]...\n",
 							__FUNCTION__, queryColCount);
@@ -1217,19 +1229,19 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 				}
 
 				while ((curr_row < num_row)
-						&& (row = mysql_fetch_row(data->m_result))) {
+						&& (row = mysql_fetch_row(data->m_dbins[SPO_DB_DEF_INS].m_result))) {
 
 					dbClassificationObj *cPtr = &(*iArrayPtr)[curr_row];
 
 					for (i = 0; i < queryColCount; i++) {
 						unsigned long *lengths = { 0 };
 
-						if ((lengths = mysql_fetch_lengths(data->m_result))
+						if ((lengths = mysql_fetch_lengths(data->m_dbins[SPO_DB_DEF_INS].m_result))
 								== NULL) {
 							free(*iArrayPtr);
 							*iArrayPtr = NULL;
-							mysql_free_result(data->m_result);
-							data->m_result = NULL;
+							mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+							data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 							FatalError(
 									"database [%s()], mysql_fetch_lengths() call failed .. \n",
 									__FUNCTION__);
@@ -1247,9 +1259,8 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 										CLASS_NAME_LEN);
 								cPtr->sig_class_name[CLASS_NAME_LEN - 1] = '\0'; //safety
 
-								if ((snort_escape_string_STATIC(
-										cPtr->sig_class_name, CLASS_NAME_LEN,
-										data))) {
+								if ((snort_escape_string_STATIC(cPtr->sig_class_name, data->sanitize_buffer[0],
+								        CLASS_NAME_LEN, data))) {
 									FatalError(
 											"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
 													"[%s], Exiting. \n",
@@ -1269,8 +1280,8 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 					curr_row++;
 				}
 
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
+				mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+				data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 				return 0;
 			}
 			break;
@@ -1280,16 +1291,16 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 		case CR_UNKNOWN_ERROR:
 		default:
 
-			if (checkTransactionState(data->dbRH)) {
+			if (checkTransactionState(&data->m_dbins[SPO_DB_DEF_INS])) {
 				LogMessage(
 						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n Failed QUERY: [%s] \n",
-						__FUNCTION__, mysql_error(data->m_sock),
-						data->SQL_SELECT);
+						__FUNCTION__, mysql_error(data->m_dbins[SPO_DB_DEF_INS].m_sock),
+						data->SQL_SELECT[SPO_DB_DEF_INS]);
 				return 1;
 			}
 
 			LogMessage("[%s()]: Failed exeuting query [%s] , will retry \n",
-					__FUNCTION__, data->SQL_SELECT);
+					__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 			break;
 
 		}
@@ -1642,21 +1653,21 @@ u_int32_t ClassificationPopulateDatabase(DatabaseData *data,
 		return 1;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
-	BeginTransaction(data);
+	BeginTransaction(data, SPO_DB_DEF_INS);
 
 	while (cacheHead != NULL) {
 		if ( !(cacheHead->flag & CACHE_DATABASE) ) {
@@ -1675,28 +1686,28 @@ u_int32_t ClassificationPopulateDatabase(DatabaseData *data,
 			 }
 			 */
 
-			DatabaseCleanInsert(data);
+			DatabaseCleanInsert(data, SPO_DB_DEF_INS);
 
-			if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_INSERT_CLASSIFICATION, cacheHead->obj.sig_class_name))
 					!= SNORT_SNPRINTF_SUCCESS) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_SELECT_SPECIFIC_CLASSIFICATION, cacheHead->obj.sig_class_name))
 					!= SNORT_SNPRINTF_SUCCESS) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if (Insert(data->SQL_INSERT, data, 1)) {
+			if (Insert(data->SQL_INSERT[SPO_DB_DEF_INS], data, 1, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if (Select(data->SQL_SELECT, data, &db_class_id)) {
+			if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, &db_class_id, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
@@ -1709,11 +1720,11 @@ u_int32_t ClassificationPopulateDatabase(DatabaseData *data,
 
 	}
 
-	CommitTransaction(data);
+	CommitTransaction(data, SPO_DB_DEF_INS);
 
 	return 0;
 
-	TransactionFail: RollbackTransaction(data);
+	TransactionFail: RollbackTransaction(data, SPO_DB_DEF_INS);
 	return 1;
 }
 
@@ -1805,35 +1816,31 @@ u_int32_t ClassificationCacheSynchronize(DatabaseData *data,
  * 0 OK (Found)
  * 1 ERROR (Not Found)
  */
-u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj)
+u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj, uint8_t q_sock)
 {
 	u_int32_t db_sig_id = 0;
 
 	if ((data == NULL) || (sObj == NULL)) {
-		/* XXX */
 		return 1;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[q_sock])) {
 		/* A This shouldn't happen since we are in failed transaction state */
-		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
+			&data->dbRH[data->dbtype_id], q_sock))) {
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[q_sock]);
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, q_sock);
+	if ((SnortSnprintf(data->SQL_SELECT[q_sock], MAX_QUERY_LENGTH,
 	SQL_SELECT_SPECIFIC_SIGNATURE_WITHOUT_MESSAGE, sObj->sid, sObj->gid,
 			sObj->rev, sObj->class_id, sObj->priority_id))
 			!= SNORT_SNPRINTF_SUCCESS) {
-		/* XXX */
 		return 1;
 	}
 
@@ -1855,8 +1862,7 @@ u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj)
 	 pretty fast to create the race condition anyways, there is a chance adding a small delay that someone will win the race
 	 */
 
-	if (Select(data->SQL_SELECT, data, &db_sig_id)) {
-		/* XXX */
+	if (Select(data->SQL_SELECT[q_sock], data, &db_sig_id, q_sock)) {
 		return 1;
 	}
 
@@ -1891,31 +1897,28 @@ u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj)
  * 1 ERROR
  */
 u_int32_t SignaturePopulateDatabase(DatabaseData *data,
-		cacheSignatureObj *cacheHead, int inTransac) {
+		cacheSignatureObj *cacheHead, int inTransac, uint8_t q_sock)
+{
 	u_int32_t db_sig_id = 0;
 
 	if ((data == NULL) || (cacheHead == NULL)) {
-		/* XXX */
 		return 1;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[q_sock])) {
 		/* A This shouldn't happen since we are in failed transaction state */
-		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
-		/* XXX */
+			&data->dbRH[data->dbtype_id], q_sock))) {
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[q_sock]);
 	}
 
 	if (inTransac == 0) {
-		if ((BeginTransaction(data))) {
-			/* XXX */
+		if ((BeginTransaction(data, q_sock))) {
 			return 1;
 		}
 	}
@@ -1951,37 +1954,35 @@ u_int32_t SignaturePopulateDatabase(DatabaseData *data,
 			 }
 			 */
 
-			DatabaseCleanInsert(data);
+			DatabaseCleanInsert(data, q_sock);
 
-			if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_INSERT[q_sock], MAX_QUERY_LENGTH,
 			SQL_INSERT_SIGNATURE, cacheHead->obj.sid, cacheHead->obj.gid,
 					cacheHead->obj.rev, cacheHead->obj.class_id,
 					cacheHead->obj.priority_id, cacheHead->obj.message))
 					!= SNORT_SNPRINTF_SUCCESS) {
-				/* XXX */
 				goto TransactionFail;
 			}
 
-			DatabaseCleanSelect(data);
+/*			DatabaseCleanSelect(data, q_sock);
 
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[q_sock], MAX_QUERY_LENGTH,
 			SQL_SELECT_SPECIFIC_SIGNATURE, cacheHead->obj.sid,
 					cacheHead->obj.gid, cacheHead->obj.rev,
 					cacheHead->obj.class_id, cacheHead->obj.priority_id,
 					cacheHead->obj.message)) != SNORT_SNPRINTF_SUCCESS) {
-				/* XXX */
 				goto TransactionFail;
-			}
+			}*/
 
-			if (Insert(data->SQL_INSERT, data, 1)) {
-				/* XXX */
+			if (Insert(data->SQL_INSERT[q_sock], data, 1, q_sock)) {
 				goto TransactionFail;
 			}
 
 /*			if (Select(data->SQL_SELECT, data, &db_sig_id)) {
 				goto TransactionFail;
 			}*/
-			db_sig_id = mysql_insert_id(data->m_sock);
+
+			db_sig_id = mysql_insert_id(data->m_dbins[q_sock].m_sock);
 			LogMessage("%s: Last query auto_increament id %d\n", __func__, db_sig_id);
 
 			cacheHead->obj.db_id = db_sig_id;
@@ -1994,16 +1995,16 @@ u_int32_t SignaturePopulateDatabase(DatabaseData *data,
 	}
 
 	if (inTransac == 0) {
-		if (CommitTransaction(data)) {
-			/* XXX */
+		if (CommitTransaction(data, q_sock)) {
 			return 1;
 		}
 	}
 
 	return 0;
 
-	TransactionFail: if (inTransac == 0) {
-		RollbackTransaction(data);
+TransactionFail:
+    if (inTransac == 0) {
+		RollbackTransaction(data, q_sock);
 	}
 
 	return 1;
@@ -2019,11 +2020,13 @@ u_int32_t SignaturePopulateDatabase(DatabaseData *data,
  * 0 OK
  * 1 ERROR
  */
-u_int32_t SignatureCacheUpdateDBid(dbSignatureObj *iDBList,
+u_int32_t SignatureCacheUpdateDBid(DatabaseData *data, dbSignatureObj *iDBList,
 		u_int32_t array_length, cacheSignatureObj **cacheHead) {
 	dbSignatureObj *cObj = NULL;
 	cacheSignatureObj *TobjNode = NULL;
 	int x = 0;
+	uint32_t ha_idx;
+	dbSignatureHashKey sigHashKey;
 
 	if (((iDBList == NULL) || (array_length == 0) || (cacheHead == NULL))) {
 		/* XXX */
@@ -2050,6 +2053,14 @@ u_int32_t SignatureCacheUpdateDBid(dbSignatureObj *iDBList,
 				TobjNode->next = *cacheHead;
 				*cacheHead = TobjNode;
 			}
+
+			//Hash Map
+			sigHashKey.gid = TobjNode->obj.gid;
+			sigHashKey.sid = TobjNode->obj.sid;
+			ha_idx = jhash(&sigHashKey, sizeof(sigHashKey), 0) & SIG_HASHSZ_MASK;
+
+			TobjNode->next_ham = data->mc.cacheSigHashMap[ha_idx];
+			data->mc.cacheSigHashMap[ha_idx] = TobjNode;
 		}
 	}
 
@@ -2104,26 +2115,26 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+	if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 	SQL_SELECT_ALL_SIGNATURE) != SNORT_SNPRINTF_SUCCESS)) {
 		FatalError(
 				"database [%s()], Unable to allocate memory for query, bailing ...\n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
 	switch (data->dbtype_id) {
@@ -2132,12 +2143,13 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 
 	case DB_MYSQL:
 
-		result = mysql_query(data->m_sock, data->SQL_SELECT);
+		result = mysql_query(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->SQL_SELECT[SPO_DB_DEF_INS]);
 
 		switch (result) {
 		case 0:
 
-			if ((data->m_result = mysql_store_result(data->m_sock)) == NULL) {
+			if ((data->m_dbins[SPO_DB_DEF_INS].m_result
+			        = mysql_store_result(data->m_dbins[SPO_DB_DEF_INS].m_sock)) == NULL) {
 				/* XXX */
 				LogMessage("[%s()], Failed call to mysql_store_result \n",
 						__FUNCTION__);
@@ -2148,11 +2160,11 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 				my_ulonglong num_row = 0;
 				unsigned int i = 0;
 
-				if ((num_row = mysql_num_rows(data->m_result)) > 0) {
+				if ((num_row = mysql_num_rows(data->m_dbins[SPO_DB_DEF_INS].m_result)) > 0) {
 					if ((*iArrayPtr = SnortAlloc(
 							(sizeof(dbSignatureObj) * num_row))) == NULL) {
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
+						mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+						data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 						FatalError(
 								"database [%s()]: Failed call to sigCacheRawAlloc() \n",
 								__FUNCTION__);
@@ -2161,8 +2173,8 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage("[%s()]: No signature found in database ... \n",
 							__FUNCTION__);
 					return 0;
@@ -2170,14 +2182,14 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 
 				*array_length = num_row;
 
-				queryColCount = mysql_num_fields(data->m_result);
+				queryColCount = mysql_num_fields(data->m_dbins[SPO_DB_DEF_INS].m_result);
 
 				if (queryColCount != NUM_ROW_SIGNATURE) {
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()] To many column returned by query [%u]...\n",
 							__FUNCTION__, queryColCount);
@@ -2185,19 +2197,19 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 				}
 
 				while ((curr_row < num_row)
-						&& (row = mysql_fetch_row(data->m_result))) {
+						&& (row = mysql_fetch_row(data->m_dbins[SPO_DB_DEF_INS].m_result))) {
 
 					dbSignatureObj *cPtr = &(*iArrayPtr)[curr_row];
 
 					for (i = 0; i < queryColCount; i++) {
 						unsigned long *lengths = { 0 };
 
-						if ((lengths = mysql_fetch_lengths(data->m_result))
+						if ((lengths = mysql_fetch_lengths(data->m_dbins[SPO_DB_DEF_INS].m_result))
 								== NULL) {
 							free(*iArrayPtr);
 							*iArrayPtr = NULL;
-							mysql_free_result(data->m_result);
-							data->m_result = NULL;
+							mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+							data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 							FatalError(
 									"database [%s()], mysql_fetch_lengths() call failed .. \n",
 									__FUNCTION__);
@@ -2235,7 +2247,7 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 								cPtr->message[SIG_MSG_LEN - 1] = '\0'; //safety
 
 								//Safety escape value.
-								if ((snort_escape_string_STATIC(cPtr->message,
+								if ((snort_escape_string_STATIC(cPtr->message, data->sanitize_buffer[0],
 										SIG_MSG_LEN, data))) {
 									FatalError(
 											"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -2254,8 +2266,8 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 					curr_row++;
 				}
 
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
+				mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+				data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 				return 0;
 			}
 			break;
@@ -2265,16 +2277,16 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 		case CR_UNKNOWN_ERROR:
 		default:
 
-			if (checkTransactionState(data->dbRH)) {
+			if (checkTransactionState(&data->m_dbins[SPO_DB_DEF_INS])) {
 				LogMessage(
 						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n Failed QUERY: [%s] \n",
-						__FUNCTION__, mysql_error(data->m_sock),
-						data->SQL_SELECT);
+						__FUNCTION__, mysql_error(data->m_dbins[SPO_DB_DEF_INS].m_sock),
+						data->SQL_SELECT[SPO_DB_DEF_INS]);
 				return 1;
 			}
 
 			LogMessage("[%s()]: Failed exeuting query [%s] , will retry \n",
-					__FUNCTION__, data->SQL_SELECT);
+					__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 			break;
 
 		}
@@ -2710,7 +2722,7 @@ u_int32_t SignatureCacheSynchronize(DatabaseData *data,
 #endif
 
 	if (array_length > 0) {
-		if ((SignatureCacheUpdateDBid(dbSigArray, array_length, cacheHead))) {
+		if ((SignatureCacheUpdateDBid(data, dbSigArray, array_length, cacheHead))) {
 			/* XXX */
 			if (dbSigArray != NULL) {
 				free(dbSigArray);
@@ -2732,7 +2744,7 @@ u_int32_t SignatureCacheSynchronize(DatabaseData *data,
 
 	LogMessage("%s: SignatureCacheUpdateDBid\n", __func__);
 
-	if (SignaturePopulateDatabase(data, *cacheHead, 0)) {
+	if (SignaturePopulateDatabase(data, *cacheHead, 0, SPO_DB_DEF_INS)) {
 		LogMessage("[%s()], Call to SignaturePopulateDatabase() failed \n",
 				__FUNCTION__);
 		return 1;
@@ -2806,26 +2818,26 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+	if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 	SQL_SELECT_ALL_REF) != SNORT_SNPRINTF_SUCCESS)) {
 		FatalError(
 				"database [%s()], Unable to allocate memory for query, bailing ...\n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
 	switch (data->dbtype_id) {
@@ -2833,11 +2845,12 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 
 	case DB_MYSQL:
 
-		result = mysql_query(data->m_sock, data->SQL_SELECT);
+		result = mysql_query(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->SQL_SELECT[SPO_DB_DEF_INS]);
 
 		switch (result) {
 		case 0:
-			if ((data->m_result = mysql_store_result(data->m_sock)) == NULL) {
+			if ((data->m_dbins[SPO_DB_DEF_INS].m_result
+			        = mysql_store_result(data->m_dbins[SPO_DB_DEF_INS].m_sock)) == NULL) {
 				/* XXX */
 				LogMessage("[%s()], Failed call to mysql_store_result \n",
 						__FUNCTION__);
@@ -2848,11 +2861,11 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 				my_ulonglong num_row = 0;
 				unsigned int i = 0;
 
-				if ((num_row = mysql_num_rows(data->m_result)) > 0) {
+				if ((num_row = mysql_num_rows(data->m_dbins[SPO_DB_DEF_INS].m_result)) > 0) {
 					if ((*iArrayPtr = SnortAlloc(
 							(sizeof(dbReferenceObj) * num_row))) == NULL) {
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
+						mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+						data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 						FatalError(
 								"database [%s()]: Failed call to sigCacheRawAlloc() \n",
 								__FUNCTION__);
@@ -2861,8 +2874,8 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage("[%s()]: No Reference found in database ... \n",
 							__FUNCTION__);
 					return 0;
@@ -2870,14 +2883,14 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 
 				*array_length = num_row;
 
-				queryColCount = mysql_num_fields(data->m_result);
+				queryColCount = mysql_num_fields(data->m_dbins[SPO_DB_DEF_INS].m_result);
 
 				if (queryColCount != NUM_ROW_REF) {
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()] To many column returned by query [%u]...\n",
 							__FUNCTION__, queryColCount);
@@ -2885,19 +2898,19 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 				}
 
 				while ((curr_row < num_row)
-						&& (row = mysql_fetch_row(data->m_result))) {
+						&& (row = mysql_fetch_row(data->m_dbins[SPO_DB_DEF_INS].m_result))) {
 
 					dbReferenceObj *cPtr = &(*iArrayPtr)[curr_row];
 
 					for (i = 0; i < queryColCount; i++) {
 						unsigned long *lengths = { 0 };
 
-						if ((lengths = mysql_fetch_lengths(data->m_result))
+						if ((lengths = mysql_fetch_lengths(data->m_dbins[SPO_DB_DEF_INS].m_result))
 								== NULL) {
 							free(*iArrayPtr);
 							*iArrayPtr = NULL;
-							mysql_free_result(data->m_result);
-							data->m_result = NULL;
+							mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+							data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 							FatalError(
 									"database [%s()], mysql_fetch_lengths() call failed .. \n",
 									__FUNCTION__);
@@ -2920,7 +2933,7 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 								cPtr->ref_tag[REF_TAG_LEN - 1] = '\0'; //toasty.
 
 								//Safety escape value.
-								if ((snort_escape_string_STATIC(cPtr->ref_tag,
+								if ((snort_escape_string_STATIC(cPtr->ref_tag, data->sanitize_buffer[0],
 										REF_TAG_LEN, data))) {
 									FatalError(
 											"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -2940,8 +2953,8 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 					curr_row++;
 				}
 
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
+				mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+				data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 				return 0;
 			}
 			break;
@@ -2951,16 +2964,16 @@ u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
 		case CR_UNKNOWN_ERROR:
 		default:
 
-			if (checkTransactionState(data->dbRH)) {
+			if (checkTransactionState(&data->m_dbins[SPO_DB_DEF_INS])) {
 				LogMessage(
 						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n Failed QUERY: [%s] \n",
-						__FUNCTION__, mysql_error(data->m_sock),
-						data->SQL_SELECT);
+						__FUNCTION__, mysql_error(data->m_dbins[SPO_DB_DEF_INS].m_sock),
+						data->SQL_SELECT[SPO_DB_DEF_INS]);
 				return 1;
 			}
 
 			LogMessage("[%s()]: Failed exeuting query [%s] , will retry \n",
-					__FUNCTION__, data->SQL_SELECT);
+					__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 			break;
 
 		}
@@ -3300,26 +3313,26 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+	if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 	SQL_SELECT_ALL_REFERENCE_SYSTEM) != SNORT_SNPRINTF_SUCCESS)) {
 		FatalError(
 				"database [%s()], Unable to allocate memory for query, bailing ...\n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
 	switch (data->dbtype_id) {
@@ -3328,11 +3341,12 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 
 	case DB_MYSQL:
 
-		result = mysql_query(data->m_sock, data->SQL_SELECT);
+		result = mysql_query(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->SQL_SELECT[SPO_DB_DEF_INS]);
 
 		switch (result) {
 		case 0:
-			if ((data->m_result = mysql_store_result(data->m_sock)) == NULL) {
+			if ((data->m_dbins[SPO_DB_DEF_INS].m_result
+			        = mysql_store_result(data->m_dbins[SPO_DB_DEF_INS].m_sock)) == NULL) {
 				/* XXX */
 				LogMessage("[%s()], Failed call to mysql_store_result \n",
 						__FUNCTION__);
@@ -3343,11 +3357,11 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 				my_ulonglong num_row = 0;
 				unsigned int i = 0;
 
-				if ((num_row = mysql_num_rows(data->m_result)) > 0) {
+				if ((num_row = mysql_num_rows(data->m_dbins[SPO_DB_DEF_INS].m_result)) > 0) {
 					if ((*iArrayPtr = SnortAlloc(
 							(sizeof(dbSystemObj) * num_row))) == NULL) {
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
+						mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+						data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 						FatalError(
 								"database [%s()]: Failed call to sigCacheRawAlloc() \n",
 								__FUNCTION__);
@@ -3356,8 +3370,8 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage("[%s()]: No System found in database ... \n",
 							__FUNCTION__);
 					return 0;
@@ -3365,14 +3379,14 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 
 				*array_length = num_row;
 
-				queryColCount = mysql_num_fields(data->m_result);
+				queryColCount = mysql_num_fields(data->m_dbins[SPO_DB_DEF_INS].m_result);
 
 				if (queryColCount != NUM_ROW_REFERENCE_SYSTEM) {
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()] To many column returned by query [%u]...\n",
 							__FUNCTION__, queryColCount);
@@ -3380,19 +3394,19 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 				}
 
 				while ((curr_row < num_row)
-						&& (row = mysql_fetch_row(data->m_result))) {
+						&& (row = mysql_fetch_row(data->m_dbins[SPO_DB_DEF_INS].m_result))) {
 
 					dbSystemObj *cPtr = &(*iArrayPtr)[curr_row];
 
 					for (i = 0; i < queryColCount; i++) {
 						unsigned long *lengths = { 0 };
 
-						if ((lengths = mysql_fetch_lengths(data->m_result))
+						if ((lengths = mysql_fetch_lengths(data->m_dbins[SPO_DB_DEF_INS].m_result))
 								== NULL) {
 							free(*iArrayPtr);
 							*iArrayPtr = NULL;
-							mysql_free_result(data->m_result);
-							data->m_result = NULL;
+							mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+							data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 							FatalError(
 									"database [%s()], mysql_fetch_lengths() call failed .. \n",
 									__FUNCTION__);
@@ -3413,9 +3427,8 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 										'\0'; //toasty.
 
 								//Safety escape value.
-								if ((snort_escape_string_STATIC(
-										cPtr->ref_system_name, SYSTEM_NAME_LEN,
-										data))) {
+								if ((snort_escape_string_STATIC(cPtr->ref_system_name, data->sanitize_buffer[0],
+								        SYSTEM_NAME_LEN, data))) {
 									FatalError(
 											"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
 													"[%s], Exiting. \n",
@@ -3435,8 +3448,8 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 					curr_row++;
 				}
 
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
+				mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+				data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 				return 0;
 			}
 			break;
@@ -3446,16 +3459,16 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 		case CR_UNKNOWN_ERROR:
 		default:
 
-			if (checkTransactionState(data->dbRH)) {
+			if (checkTransactionState(&data->m_dbins[SPO_DB_DEF_INS])) {
 				LogMessage(
 						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n Failed QUERY: [%s] \n",
-						__FUNCTION__, mysql_error(data->m_sock),
-						data->SQL_SELECT);
+						__FUNCTION__, mysql_error(data->m_dbins[SPO_DB_DEF_INS].m_sock),
+						data->SQL_SELECT[SPO_DB_DEF_INS]);
 				return 1;
 			}
 
 			LogMessage("[%s()]: Failed exeuting query [%s] , will retry \n",
-					__FUNCTION__, data->SQL_SELECT);
+					__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 			break;
 
 		}
@@ -3863,21 +3876,21 @@ u_int32_t ReferencePopulateDatabase(DatabaseData *data,
 		return 1;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
-	BeginTransaction(data);
+	BeginTransaction(data, SPO_DB_DEF_INS);
 
 	while (cacheHead != NULL) {
 		if ( !(cacheHead->flag & CACHE_DATABASE) ) {
@@ -3888,9 +3901,9 @@ u_int32_t ReferencePopulateDatabase(DatabaseData *data,
 
 			/* Removed the escaping because we live escaped in the cache */
 
-			DatabaseCleanInsert(data);
+			DatabaseCleanInsert(data, SPO_DB_DEF_INS);
 
-			if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_INSERT_SPECIFIC_REF,
 					cacheHead->obj.parent->obj.db_ref_system_id,
 					cacheHead->obj.ref_tag)) != SNORT_SNPRINTF_SUCCESS) {
@@ -3898,9 +3911,9 @@ u_int32_t ReferencePopulateDatabase(DatabaseData *data,
 				goto TransactionFail;
 			}
 
-			DatabaseCleanSelect(data);
+			DatabaseCleanSelect(data, SPO_DB_DEF_INS);
 
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_SELECT_SPECIFIC_REF,
 					cacheHead->obj.parent->obj.db_ref_system_id,
 					cacheHead->obj.ref_tag)) != SNORT_SNPRINTF_SUCCESS) {
@@ -3908,12 +3921,12 @@ u_int32_t ReferencePopulateDatabase(DatabaseData *data,
 				goto TransactionFail;
 			}
 
-			if (Insert(data->SQL_INSERT, data, 1)) {
+			if (Insert(data->SQL_INSERT[SPO_DB_DEF_INS], data, 1, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if (Select(data->SQL_SELECT, data, &db_ref_id)) {
+			if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, &db_ref_id, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
@@ -3928,11 +3941,11 @@ u_int32_t ReferencePopulateDatabase(DatabaseData *data,
 		cacheHead = cacheHead->next;
 	}
 
-	CommitTransaction(data);
+	CommitTransaction(data, SPO_DB_DEF_INS);
 
 	return 0;
 
-	TransactionFail: RollbackTransaction(data);
+	TransactionFail: RollbackTransaction(data, SPO_DB_DEF_INS);
 	return 1;
 }
 
@@ -3959,21 +3972,21 @@ u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead) 
 		return 0;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
-	BeginTransaction(data);
+	BeginTransaction(data, SPO_DB_DEF_INS);
 
 	while (cacheHead != NULL) {
 		if ( !(cacheHead->flag & CACHE_DATABASE) ) {
@@ -3981,7 +3994,7 @@ u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead) 
 			inserted_system_object_count++;
 #endif
 
-			if ((snort_escape_string_STATIC(cacheHead->obj.ref_system_name,
+			if ((snort_escape_string_STATIC(cacheHead->obj.ref_system_name, data->sanitize_buffer[0],
 					SYSTEM_NAME_LEN, data))) {
 				FatalError(
 						"database [%s()], Failed a call to snort_escape_string_STATIC() for string : \n"
@@ -3989,30 +4002,30 @@ u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead) 
 						cacheHead->obj.ref_system_name);
 			}
 
-			DatabaseCleanInsert(data);
+			DatabaseCleanInsert(data, SPO_DB_DEF_INS);
 
-			if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_INSERT_SPECIFIC_REFERENCE_SYSTEM,
 					cacheHead->obj.ref_system_name)) != SNORT_SNPRINTF_SUCCESS) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			DatabaseCleanSelect(data);
+			DatabaseCleanSelect(data, SPO_DB_DEF_INS);
 
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_SELECT_SPECIFIC_REFERENCE_SYSTEM,
 					cacheHead->obj.ref_system_name)) != SNORT_SNPRINTF_SUCCESS) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if (Insert(data->SQL_INSERT, data, 1)) {
+			if (Insert(data->SQL_INSERT[SPO_DB_DEF_INS], data, 1, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
 
-			if (Select(data->SQL_SELECT, data, &db_system_id)) {
+			if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, &db_system_id, SPO_DB_DEF_INS)) {
 				/* XXX */
 				goto TransactionFail;
 			}
@@ -4035,11 +4048,11 @@ u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead) 
 		cacheHead = cacheHead->next;
 	}
 
-	CommitTransaction(data);
+	CommitTransaction(data, SPO_DB_DEF_INS);
 
 	return 0;
 
-	TransactionFail: RollbackTransaction(data);
+	TransactionFail: RollbackTransaction(data, SPO_DB_DEF_INS);
 	return 1;
 }
 
@@ -4276,26 +4289,26 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 		return 1;
 	}
 
-	DatabaseCleanSelect(data);
-	if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+	DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+	if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 	SQL_SELECT_ALL_SIGREF) != SNORT_SNPRINTF_SUCCESS)) {
 		FatalError(
 				"database [%s()], Unable to allocate memory for query, bailing ...\n",
 				__FUNCTION__);
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		/* XXX */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		/* XXX */
 		FatalError(
 				"database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
 	switch (data->dbtype_id) {
@@ -4303,11 +4316,12 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 #ifdef ENABLE_MYSQL
 	case DB_MYSQL:
 
-		result = mysql_query(data->m_sock, data->SQL_SELECT);
+		result = mysql_query(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->SQL_SELECT[SPO_DB_DEF_INS]);
 
 		switch (result) {
 		case 0:
-			if ((data->m_result = mysql_store_result(data->m_sock)) == NULL) {
+			if ((data->m_dbins[SPO_DB_DEF_INS].m_result
+			        = mysql_store_result(data->m_dbins[SPO_DB_DEF_INS].m_sock)) == NULL) {
 				/* XXX */
 				LogMessage("[%s()], Failed call to mysql_store_result \n",
 						__FUNCTION__);
@@ -4318,12 +4332,12 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 				my_ulonglong num_row = 0;
 				unsigned int i = 0;
 
-				if ((num_row = mysql_num_rows(data->m_result)) > 0) {
+				if ((num_row = mysql_num_rows(data->m_dbins[SPO_DB_DEF_INS].m_result)) > 0) {
 					if ((*iArrayPtr = SnortAlloc(
 							(sizeof(dbSignatureReferenceObj) * num_row)))
 							== NULL) {
-						mysql_free_result(data->m_result);
-						data->m_result = NULL;
+						mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+						data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 						FatalError(
 								"database [%s()]: Failed call to sigCacheRawAlloc() \n",
 								__FUNCTION__);
@@ -4332,8 +4346,8 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage("[%s()]: No Reference found in database ... \n",
 							__FUNCTION__);
 					return 0;
@@ -4341,14 +4355,14 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 
 				*array_length = num_row;
 
-				queryColCount = mysql_num_fields(data->m_result);
+				queryColCount = mysql_num_fields(data->m_dbins[SPO_DB_DEF_INS].m_result);
 
 				if (queryColCount != NUM_ROW_SIGREF) {
 					/* XXX */
 					free(*iArrayPtr);
 					*iArrayPtr = NULL;
-					mysql_free_result(data->m_result);
-					data->m_result = NULL;
+					mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+					data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 					LogMessage(
 							"[%s()] To many column returned by query [%u]...\n",
 							__FUNCTION__, queryColCount);
@@ -4356,18 +4370,18 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 				}
 
 				while ((curr_row < num_row)
-						&& (row = mysql_fetch_row(data->m_result))) {
+						&& (row = mysql_fetch_row(data->m_dbins[SPO_DB_DEF_INS].m_result))) {
 					dbSignatureReferenceObj *cPtr = &(*iArrayPtr)[curr_row];
 
 					for (i = 0; i < queryColCount; i++) {
 						unsigned long *lengths = { 0 };
 
-						if ((lengths = mysql_fetch_lengths(data->m_result))
+						if ((lengths = mysql_fetch_lengths(data->m_dbins[SPO_DB_DEF_INS].m_result))
 								== NULL) {
 							free(*iArrayPtr);
 							*iArrayPtr = NULL;
-							mysql_free_result(data->m_result);
-							data->m_result = NULL;
+							mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+							data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 							FatalError(
 									"database [%s()], mysql_fetch_lengths() call failed .. \n",
 									__FUNCTION__);
@@ -4395,8 +4409,8 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 					curr_row++;
 				}
 
-				mysql_free_result(data->m_result);
-				data->m_result = NULL;
+				mysql_free_result(data->m_dbins[SPO_DB_DEF_INS].m_result);
+				data->m_dbins[SPO_DB_DEF_INS].m_result = NULL;
 				return 0;
 			}
 			break;
@@ -4406,16 +4420,16 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 		case CR_UNKNOWN_ERROR:
 		default:
 
-			if (checkTransactionState(data->dbRH)) {
+			if (checkTransactionState(&data->m_dbins[SPO_DB_DEF_INS])) {
 				LogMessage(
 						"[%s()]: Failed executing with error [%s], in transaction will Abort. \n Failed QUERY: [%s] \n",
-						__FUNCTION__, mysql_error(data->m_sock),
-						data->SQL_SELECT);
+						__FUNCTION__, mysql_error(data->m_dbins[SPO_DB_DEF_INS].m_sock),
+						data->SQL_SELECT[SPO_DB_DEF_INS]);
 				return 1;
 			}
 
 			LogMessage("[%s()]: Failed exeuting query [%s] , will retry \n",
-					__FUNCTION__, data->SQL_SELECT);
+					__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 			break;
 
 		}
@@ -4972,18 +4986,18 @@ u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
 		return 0;
 	}
 
-	if (checkTransactionCall(&data->dbRH[data->dbtype_id])) {
+	if (checkTransactionCall(&data->m_dbins[SPO_DB_DEF_INS])) {
 		/* A This shouldn't happen since we are in failed transaction state */
 		return 1;
 	}
 
 	if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
-			&data->dbRH[data->dbtype_id]))) {
+			&data->dbRH[data->dbtype_id], SPO_DB_DEF_INS))) {
 		FatalError("database [%s()], Select Query[%s] failed check to dbConnectionStatus()\n",
-				__FUNCTION__, data->SQL_SELECT);
+				__FUNCTION__, data->SQL_SELECT[SPO_DB_DEF_INS]);
 	}
 
-	if ((BeginTransaction(data))) {
+	if ((BeginTransaction(data, SPO_DB_DEF_INS))) {
 	    return 1;
 	}
 
@@ -4994,8 +5008,8 @@ u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
 			inserted_sigref_object_count++;
 #endif
 
-			DatabaseCleanInsert(data);
-			if ((SnortSnprintf(data->SQL_INSERT, MAX_QUERY_LENGTH,
+			DatabaseCleanInsert(data, SPO_DB_DEF_INS);
+			if ((SnortSnprintf(data->SQL_INSERT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_INSERT_SIGREF, cacheHead->obj.db_ref_id,
 					cacheHead->obj.db_sig_id, cacheHead->obj.ref_seq))
 					!= SNORT_SNPRINTF_SUCCESS) {
@@ -5003,8 +5017,8 @@ u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
 				//goto f_exit;
 			}
 
-			DatabaseCleanSelect(data);
-			if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH,
+			DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+			if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH,
 			SQL_SELECT_SPECIFIC_SIGREF, cacheHead->obj.db_ref_id,
 					cacheHead->obj.db_sig_id, cacheHead->obj.ref_seq))
 					!= SNORT_SNPRINTF_SUCCESS) {
@@ -5015,18 +5029,18 @@ u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
 			/* Prevent race.. */
 			usleep(100);
 
-			if (Select(data->SQL_SELECT, data, &row_validate)) {
+			if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, &row_validate, SPO_DB_DEF_INS)) {
 				/* Entry was not found */
 				if (row_validate == 0) {
 					//BeginTransaction(data);
 
-					if (Insert(data->SQL_INSERT, data, 1)) {
+					if (Insert(data->SQL_INSERT[SPO_DB_DEF_INS], data, 1, SPO_DB_DEF_INS)) {
 						goto TransactionFail;
 					}
 
 					row_validate = 0;
 
-					if (Select(data->SQL_SELECT, data, &row_validate)) {
+					if (Select(data->SQL_SELECT[SPO_DB_DEF_INS], data, &row_validate, SPO_DB_DEF_INS)) {
 						goto TransactionFail;
 					}
 
@@ -5050,14 +5064,14 @@ u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
 		cacheHead = cacheHead->next;
 	}
 
-	if (CommitTransaction(data)) {
+	if (CommitTransaction(data, SPO_DB_DEF_INS)) {
 	    return 1;
 	}
 
 	return 0;
 
 TransactionFail:
-    RollbackTransaction(data);
+    RollbackTransaction(data, SPO_DB_DEF_INS);
 /*f_exit:*/
     return 1;
 }
@@ -5222,6 +5236,9 @@ void MasterCacheFlush(DatabaseData *data, u_int32_t flushFlag) {
 		}
 
 		data->mc.cacheSignatureHead = NULL;
+
+		//Clean Hash Map also
+		memset(data->mc.cacheSigHashMap, 0, sizeof(data->mc.cacheSigHashMap));
 	}
 
 	if ((data->mc.cacheClassificationHead != NULL)
@@ -5382,8 +5399,7 @@ u_int32_t CacheSynchronize(DatabaseData *data) {
 #endif
 
 	/* Since we do not need reference and sig_reference clear those cache (free memory) and clean signature reference list and count */
-	MasterCacheFlush(data,
-			CACHE_FLUSH_SYSTEM_REF | CACHE_FLUSH_SIGREF | CACHE_FLUSH_SIGREF);
+	MasterCacheFlush(data, CACHE_FLUSH_SYSTEM_REF | CACHE_FLUSH_SIGREF);
 	/* Since we do not need reference and sig_reference clear those cache (free memory) and clean signature reference list and count */
 
 	LogMessage("%s: MasterCacheFlush\n", __func__);

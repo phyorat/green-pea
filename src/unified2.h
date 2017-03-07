@@ -54,12 +54,15 @@ typedef enum __unified2_serve_type
     MAX_EVENT_APPNAME_LEN = 16,
 #endif
 
+    UNIFIED2_INVALID_REC = 202,
+
     UNIFIED2_IDS_FLUSH = 2001,
     UNIFIED2_IDS_GET_MCID = 2002,
     UNIFIED2_IDS_SET_MCID = 2003,
     UNIFIED2_IDS_UPD_MCID = 2004,
     UNIFIED2_IDS_FLUSH_OUT = 2005,
     UNIFIED2_IDS_SPO_EXIT = 2006,
+    UNIFIED2_IDS_GET_ELEQUE_INS = 2007,
 }unified2_serve_type;
 
 /* Each unified2 record will start out with one of these */

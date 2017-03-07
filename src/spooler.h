@@ -76,6 +76,9 @@ typedef enum
 
 #define MAX_FILEPATH_BUF    1024
 
+#define handle_error_en(en, msg) \
+        do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
+
 //#####USI Set up######################
 #ifndef ENABLE_MYSQL
   #define ENABLE_MYSQL
@@ -85,36 +88,36 @@ typedef enum
 #define SPOOLER_FIXED_BUF
 #define SPOOLER_RECORD_RING
 #define SPOOLER_RBUF_SIZE	    65536
-#define SPOOLER_RING_SIZE	    8192
-#define SPOOLER_RING_BITMASK    (0x1FFF)
+#define SPOOLER_RING_SIZE       (0x2000)
+#define SPOOLER_RING_BITMASK    (SPOOLER_RING_SIZE-1)
 #define SPOOLER_DUAL_THREAD
 
 #define SPOOLER_RING_PLUSONE(num)		(((num)+1) & SPOOLER_RING_BITMASK)
 
 #define SPOOLER_RING_INC(para)		do{ \
 										pthread_mutex_lock(&para->lock_ring);	\
-										(para->sring->event_cur) = ((para->sring->event_cur)+1) & 0x1FFF;	\
+										(para->sring->event_prod) = ((para->sring->event_prod)+1) & SPOOLER_RING_BITMASK;	\
 										para->sring->event_cnt++;	\
 										pthread_mutex_unlock(&para->lock_ring);	\
 										}while(0);
 
 #define SPOOLER_RING_DEC(para)		do{ \
 										pthread_mutex_lock(&para->lock_ring);	\
-										(para->sring->event_top) = ((para->sring->event_top)+1) & 0x1FFF;	\
+										(para->sring->event_top) = ((para->sring->event_top)+1) & SPOOLER_RING_BITMASK;	\
 										para->sring->event_cnt--;	\
 										pthread_mutex_unlock(&para->lock_ring);	\
 										}while(0);
 
 #define SPOOLER_RING_EVENT_DEC(para)		do{ \
 												pthread_mutex_lock(&para->lock_ring);	\
-												(para->sring->event_top) = ((para->sring->event_top)+2) & 0x1FFF;	\
+												(para->sring->event_top) = ((para->sring->event_top)+2) & SPOOLER_RING_BITMASK;	\
 												para->sring->event_cnt -= 2;	\
 												pthread_mutex_unlock(&para->lock_ring);	\
 											}while(0);
 
 #define SPOOLER_RING_COMS_N_DEC(para, num)	do{ \
 												pthread_mutex_lock(&para->lock_ring);	\
-												(para->sring->event_coms) = ((para->sring->event_coms)+num) & 0x1FFF;	\
+												(para->sring->event_coms) = ((para->sring->event_coms)+num) & SPOOLER_RING_BITMASK;	\
 												pthread_mutex_unlock(&para->lock_ring);	\
 											}while(0);
 
@@ -142,7 +145,7 @@ typedef enum
 
 #define SPOOLER_RING_FULL(ring)			( SPOOLER_RING_SIZE <= (ring)->event_cnt )
 #define SPOOLER_RING_EMPTY(ring)		( 0 == (ring)->event_cnt )
-#define SPOOLER_RING_PROCEED(ring)		( (((ring)->event_cur+1)&0x1FFF) != (ring)->event_coms )
+#define SPOOLER_RING_PROCEED(ring)		( (((ring)->event_prod+1)&SPOOLER_RING_BITMASK) != (ring)->event_coms )
 
 
 //#####USI Set up end##################
@@ -213,7 +216,7 @@ typedef enum
 typedef struct __spooler_ring
 {
     EventRecordNode         event_cache[SPOOLER_RING_SIZE];
-    uint16_t                event_cur;
+    uint16_t                event_prod;
     uint16_t                event_top;
     uint16_t                event_coms;
     uint16_t                event_cnt;

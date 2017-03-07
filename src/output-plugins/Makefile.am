@@ -22,6 +22,7 @@ spo_log_tcpdump.c spo_log_tcpdump.h \
 spo_sguil.c spo_sguil.h \
 spo_echidna.c spo_echidna.h \
 spo_syslog_full.c spo_syslog_full.h \
+spo_database_if.c spo_database_if.h \
 spo_database.c spo_database.h \
 spo_database_cache.c spo_database_cache.h \
 spo_database_fm.c spo_database_fm.h

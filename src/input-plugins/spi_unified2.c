@@ -307,7 +307,7 @@ uint16_t Unified2RetrieveRecordHeader(Spooler *spooler, uint16_t r_len)
 	DEBUG_U_WRAP(LogMessage("%s: event_cur %d, event_top %d\n", __func__,
 	        spooler->spara->sring->event_cur, spooler->spara->sring->event_top));
 
-	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].header;
+	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].header;
 	ret_len = Unified2GetRecFromBuf(spooler, pbuf, r_len);
 
 	if ( ret_len < r_len ) {
@@ -326,7 +326,7 @@ uint16_t Unified2RetrieveRecord(Spooler *spooler, uint16_t r_len)
 	uint16_t ret_len;
 	uint8_t *pbuf;
 
-	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].data;
+	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].data;
 	ret_len = Unified2GetRecFromBuf(spooler, pbuf, r_len);
 
 	if ( ret_len < r_len ) {
@@ -419,6 +419,7 @@ int Unified2ReadRecordHeader(void *sph)
 
 int Unified2ReadRecord(void *sph)
 {
+    uint8_t             record_valid = 0;
     ssize_t             bytes_read;
     uint32_t            record_type;
     uint32_t            record_length;
@@ -426,7 +427,7 @@ int Unified2ReadRecord(void *sph)
     EventRecordNode     *ernCache;
 
     /* convert once */
-    ernCache = &(spooler->spara->sring->event_cache[spooler->spara->sring->event_cur]);
+    ernCache = &(spooler->spara->sring->event_cache[spooler->spara->sring->event_prod]);
     record_type = ntohl(((Unified2RecordHeader *)ernCache->header)->type);
     record_length = ntohl(((Unified2RecordHeader *)ernCache->header)->length);
 
@@ -499,11 +500,16 @@ int Unified2ReadRecord(void *sph)
             {
                 DEBUG_U_WRAP(LogMessage("%s: parse pkt, ernCache->data %x\n", __func__, ernCache->data));
                 spoolerRetrievePktData(ernCache->s_pkt, ernCache->data);
+
+                record_valid = 1;
             }
             break;
-        case UNIFIED2_EXTRA_DATA:
-            break;
-        default:    //Event
+        case UNIFIED2_IDS_EVENT:    //Event
+        case UNIFIED2_IDS_EVENT_IPV6:
+        case UNIFIED2_IDS_EVENT_MPLS:
+        case UNIFIED2_IDS_EVENT_IPV6_MPLS:
+        case UNIFIED2_IDS_EVENT_VLAN:
+        case UNIFIED2_IDS_EVENT_IPV6_VLAN:
             {
     			/* Ready to throw record into ring, if e_id is smaller than expect from Database, move forward. */
             	if ( RING_PRE_ON == spooler->spara->sring->r_switch ) {	//Let's Roll
@@ -531,8 +537,18 @@ int Unified2ReadRecord(void *sph)
                 }
             	/* Save previous event id */
                 spooler->spara->sring->prev_eventid = ernCache->event_id;
+
+                record_valid = 1;
             }
             break;
+        case UNIFIED2_EXTRA_DATA:
+            break;
+        default:
+            break;
+        }
+
+        if ( 0 == record_valid ) {
+            ernCache->type = UNIFIED2_INVALID_REC;
         }
 
         ernCache->event_id += spooler->spara->sring->base_eventid;

@@ -43,7 +43,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
 #include "squirrel.h"
 #include "debug.h"
@@ -103,10 +102,6 @@ typedef SQLCHAR ODBC_SQLCHAR;
 #define DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN MAX_QUERY_LENGTH /* Should theorically be enough to escape ....alot of queries */
 #endif /* DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN */
 
-#define SQL_QUERY_INS_MAX                   (1<<2)//(1<<10)
-#define SQL_QUERY_INS_MASK                  (SQL_QUERY_INS_MAX-1)   //Corresponding to MAX
-#define SQL_QUERY_INS_PLUS_ONE(ins)         ((ins+1) & SQL_QUERY_INS_MASK)
-
 #define MAX_SQL_QUERY_OPS			50 /* In case we get a IP packet with 40 options */
 #define MAX_SQL_QUERY_LENGTH		(0x800000)
 
@@ -119,6 +114,8 @@ typedef SQLCHAR ODBC_SQLCHAR;
 #define SQL_PKT_BUF_LEN         0x10000
 #define SQL_EVENT_QUEUE_LEN     1000
 #define SQL_PKT_QUEUE_LEN       1000
+
+//#define IF_SPO_QUERY_IN_THREAD        //If start Query Separate Threads
 
 /******** Data Types  **************************************************/
 /* enumerate the supported databases */
@@ -159,6 +156,9 @@ typedef enum db_types_en dbtype_t;
 #ifndef MAX_SIGLOOKUP
 #define MAX_SIGLOOKUP 255
 #endif /* MAX_SIGLOOKUP */
+
+#define MAX_SIG_HASHSZ          4096
+#define SIG_HASHSZ_MASK         (MAX_SIG_HASHSZ-1)
 
 /* ------------------------------------------
  * REFERENCE OBJ 
@@ -247,6 +247,11 @@ typedef struct _cacheClassificationObj {
 /* ------------------------------------------
  * SIGNATURE OBJ
  ------------------------------------------ */
+typedef struct _dbSignatureHashKey {
+    u_int32_t sid;
+    u_int32_t gid;
+} dbSignatureHashKey;
+
 typedef struct _dbSignatureObj {
 	u_int32_t db_id;
 	u_int32_t sid;
@@ -267,7 +272,7 @@ typedef struct _cacheSignatureObj {
 	dbSignatureObj obj;
 	u_int32_t flag; /* Where its at */
 	struct _cacheSignatureObj *next;
-
+	struct _cacheSignatureObj *next_ham;
 } cacheSignatureObj;
 /* ------------------------------------------
  * SIGNATURE OBJ
@@ -296,6 +301,7 @@ typedef struct _masterCache {
 	cacheSignatureObj *cacheSignatureHead;
 	cacheSystemObj *cacheSystemHead;
 	cacheSignatureReferenceObj *cacheSigReferenceHead;
+	cacheSignatureObj *cacheSigHashMap[MAX_SIG_HASHSZ];
 	plgSignatureObj plgSigCompare[MAX_SIGLOOKUP]; /* Used by spo_database when querying the cache for signature match */
 
 } MasterCache;
@@ -405,6 +411,28 @@ typedef struct _SQLQueryList {
   #define ENABLE_MYSQL
 #endif
 
+#define     SPO_DB_DEF_INS        0     //Default Instance
+
+//#define DEBUG_USI_SPOOLER_QUERY
+//#define DEBUG_USI_SPOOLER_DB
+//#define DEBUG_USI_SPOOLER_ELEQUE
+
+#ifdef DEBUG_USI_SPOOLER_QUERY
+  #define DEBUG_U_WRAP_SP_QUERY(code)   do{code;}while(0);
+#else
+  #define DEBUG_U_WRAP_SP_QUERY(code)
+#endif
+#ifdef DEBUG_USI_SPOOLER_ELEQUE
+  #define DEBUG_U_WRAP_SP_ELEQUE(code)   do{code;}while(0);
+#else
+  #define DEBUG_U_WRAP_SP_ELEQUE(code)
+#endif
+#ifdef DEBUG_USI_SPOOLER_DB
+  #define DEBUG_U_WRAP_SP_DB(code)   do{code;}while(0);
+#else
+  #define DEBUG_U_WRAP_SP_DB(code)
+#endif
+
 typedef struct __SQLAdPkt {
     uint8_t rid;
     us_cid_t event_id;
@@ -426,6 +454,7 @@ typedef struct __SQLEvent {
 typedef struct __SQLEventQueue {
     uint16_t ele_cnt;
     uint16_t ele_exp_cnt;
+    RingTopOct *ele_rtOct;
 //    uint8_t event_id_1_cnt[BY_MUL_TR_DEFAULT];
     char ele_pktbuf[SQL_PKT_BUF_LEN];
     SQLEvent ele[SQL_EVENT_QUEUE_LEN];
@@ -435,20 +464,13 @@ typedef struct __SQLEventQueue {
 /*  Databse Reliability  */
 typedef struct _dbReliabilityHandle {
 
-	u_int32_t dbConnectionCount; /* Count of effective reconnection */
 	u_int32_t dbConnectionLimit; /* Limit or reconnection try */
 	u_int32_t dbLimitReachFailsafe; /* Limit of time we wrap the reconnection try */
-	u_int32_t dbConnectionStat; /* Database Connection status (barnyard2) */
-	u_int32_t dbReconnectedInTransaction;
+    u_int8_t transactionErrorThreshold; /* Consider the transaction threshold to be the same as reconnection maxiumum */
 
-	struct timespec dbReconnectSleepTime; /* Sleep time (milisec) before attempting a reconnect */
-
-	u_int8_t checkTransaction; /* If set , we are in transaction */
-	u_int8_t transactionCallFail; /* if(checkTransaction) && error set ! */
-	u_int8_t transactionErrorCount; /* Number of transaction fail for a single transaction (Reset by sucessfull commit)*/
-	u_int8_t transactionErrorThreshold; /* Consider the transaction threshold to be the same as reconnection maxiumum */
-
+    struct timespec dbReconnectSleepTime; /* Sleep time (milisec) before attempting a reconnect */
 	u_int8_t disablesigref; /* Allow user to prevent generation and creation of signature reference table */
+    my_bool mysql_reconnect; /* We will handle it via the api. */
 
 	struct _DatabaseData *dbdata; /* Pointer to parent structure used for call clarity */
 
@@ -460,9 +482,6 @@ typedef struct _dbReliabilityHandle {
 	char *ssl_ca_path;
 	char *ssl_cipher;
 	/* Herited from shared data globals */
-
-	unsigned long pThreadID; /* Used to store thread information and know if we "reconnected automaticaly" */
-	my_bool mysql_reconnect; /* We will handle it via the api. */
 #endif /* ENABLE_MYSQL */
 
 #ifdef ENABLE_POSTGRESQL
@@ -481,7 +500,7 @@ typedef struct _dbReliabilityHandle {
 #endif
 
 	/* Set by dbms specific setup function */
-	u_int32_t (*dbConnectionStatus)(struct _dbReliabilityHandle *);
+	u_int32_t (*dbConnectionStatus)(struct _dbReliabilityHandle *, uint8_t);
 } dbReliabilityHandle;
 /*  Databse Reliability  */
 
@@ -515,11 +534,31 @@ typedef struct __lquery_instance
     void *spo_data;
 }lquery_instance;
 
+typedef struct _DatabaseIns
+{
+    void *spo_data;
+    MYSQL * m_sock;
+    MYSQL_RES * m_result;
+    MYSQL_ROW m_row;
+
+    u_int32_t dbConnectionCount; /* Count of effective reconnection */
+    u_int32_t dbConnectionStat; /* Database Connection status (barnyard2) */
+    u_int32_t dbReconnectedInTransaction;
+
+    u_int8_t checkTransaction; /* If set , we are in transaction */
+    u_int8_t transactionCallFail; /* if(checkTransaction) && error set ! */
+    u_int8_t transactionErrorCount; /* Number of transaction fail for a single transaction (Reset by sucessfull commit)*/
+    uint8_t q_sock_idx;
+
+    unsigned long pThreadID; /* Used to store thread information and know if we "reconnected automaticaly" */
+}DatabaseIns;
+
 typedef struct _DatabaseData
 {
     uint8_t enc_q_ins;
     uint8_t refresh_mcid;
     u_short dbtype_id;
+    uint32_t sql_q_bitmap;
 	char *facility;
 	char *password;
 	char *user;
@@ -542,22 +581,23 @@ typedef struct _DatabaseData
 
 	/* Some static allocated buffers, they might need some cleanup before release */
 	char timestampHolder[SMALLBUFFER]; /* For timestamp conversion .... */
-	char PacketDataNotEscaped[MAX_QUERY_LENGTH];
-	char PacketData[MAX_QUERY_LENGTH];
-	char sanitize_buffer[DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN];
+	char PacketDataNotEscaped[SQL_QUERY_SOCK_MAX][MAX_QUERY_LENGTH];
+	char PacketData[SQL_QUERY_SOCK_MAX][MAX_QUERY_LENGTH];
+	char sanitize_buffer[SQL_QUERY_SOCK_MAX][DATABASE_MAX_ESCAPE_STATIC_BUFFER_LEN];
 	/* Some static allocated buffers, they might need some cleanup before release */
 
 	/* Used for generic queries if you need consequtives queries uses SQLQueryList*/
-	char *SQL_SELECT;
-	char *SQL_INSERT;
+	char *SQL_SELECT[SQL_QUERY_SOCK_MAX];
+	char *SQL_INSERT[SQL_QUERY_SOCK_MAX];
 
 	u_int32_t SQL_SELECT_SIZE;
 	u_int32_t SQL_INSERT_SIZE;
 	/* Used for generic queries if you need consequtives queries uses SQLQueryList*/
 
 	pthread_mutex_t lquery_lock;
-	pthread_t tid_query;
-	lquery_instance lquery_ins[SQL_QUERY_INS_MAX];
+	pthread_mutex_t lsiginfo_lock;
+	pthread_t tid_query[SQL_QUERY_SOCK_MAX];
+	lquery_instance lEleQue_ins[SQL_ELEQUE_INS_MAX];
 	MasterCache mc;
 
 #ifdef ENABLE_POSTGRESQL
@@ -569,10 +609,10 @@ typedef struct _DatabaseData
 #endif
 #endif
 #ifdef ENABLE_MYSQL
-	MYSQL * m_sock;
-	MYSQL * m_sock2;
+/*	MYSQL * m_sock;
 	MYSQL_RES * m_result;
-	MYSQL_ROW m_row;
+	MYSQL_ROW m_row;*/
+	DatabaseIns m_dbins[SQL_QUERY_SOCK_MAX];
 #endif
 #ifdef ENABLE_ODBC
 	SQLHENV u_handle;
@@ -608,6 +648,7 @@ typedef struct _DatabaseData
 	struct _dbReliabilityHandle dbRH[DB_ENUM_MAX_VAL];
 /*  Databse Reliability  */
 
+	uint64_t cpuset_bm;     //Support Maximum 64 cores
 } DatabaseData;
 
 /******** Constants  ***************************************************/
@@ -693,53 +734,56 @@ static int mssql_msg_handler(PDBPROCESS dbproc, DBINT msgno, int msgstate,
 /* NOTE: -elz prototypes will need some cleanup before release */
 DatabaseData *InitDatabaseData(char *args);
 char *snort_escape_string(char *, DatabaseData *);
-u_int32_t snort_escape_string_STATIC(char *from, u_int32_t buffer_max_len,
+u_int32_t snort_escape_string_STATIC(char *from, char *buff_esc, u_int32_t buffer_max_len,
 		DatabaseData *data);
 
 void DatabaseInit(char *);
 void DatabaseInitFinalize(int unused, void *arg);
 void ParseDatabaseArgs(DatabaseData *data);
 void *Spo_EncodeSql(void *);
+#ifdef IF_SPO_QUERY_IN_THREAD
 void *Spo_ProcQuery(void *);
+#else
+void Spo_ProcQuery(void *);
+#endif
 void Spo_Database(Packet *, void *, uint32_t, void *);
 void SpoDatabaseCleanExitFunction(int, void *);
 void SpoDatabaseRestartFunction(int, void *);
 void InitDatabase();
-void Connect(DatabaseData *);
 void DatabasePrintUsage();
 
-int Insert(char *, DatabaseData *, u_int32_t);
-int Insert_real(char * , uint32_t , DatabaseData *, u_int32_t);
-int Select(char *, DatabaseData *, u_int32_t *);
-int Select_bigint(char *, DatabaseData *, uint64_t *);
-int UpdateLastCid(DatabaseData *, uint8_t, uint8_t);
+int Insert(char *, DatabaseData *, u_int32_t, uint8_t);
+int Insert_real(char * , uint32_t , DatabaseData *, u_int32_t, uint8_t);
+int Select(char *, DatabaseData *, u_int32_t *, uint8_t);
+int Select_bigint(char *, DatabaseData *, uint64_t *, uint8_t);
+int UpdateLastCid(DatabaseData *, uint8_t, uint8_t, uint8_t);
 int GetLastCid(DatabaseData *);
 int GetLastCidFromTable(DatabaseData *);
 int CheckDBVersion(DatabaseData *);
 
-u_int32_t BeginTransaction(DatabaseData * data);
-u_int32_t CommitTransaction(DatabaseData * data);
-u_int32_t RollbackTransaction(DatabaseData * data);
+u_int32_t BeginTransaction(DatabaseData *, uint8_t);
+u_int32_t CommitTransaction(DatabaseData *, uint8_t);
+u_int32_t RollbackTransaction(DatabaseData *, uint8_t);
 
-u_int32_t checkDatabaseType(DatabaseData *data);
-u_int32_t checkTransactionState(dbReliabilityHandle *pdbRH);
-u_int32_t checkTransactionCall(dbReliabilityHandle *pdbRH);
-u_int32_t dbReconnectSetCounters(dbReliabilityHandle *pdbRH);
-u_int32_t MYSQL_ManualConnect(DatabaseData *dbdata);
-u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH);
+u_int32_t checkDatabaseType(DatabaseData *);
+u_int32_t checkTransactionState(DatabaseIns *);
+u_int32_t checkTransactionCall(DatabaseIns *);
+u_int32_t dbReconnectSetCounters(dbReliabilityHandle *, DatabaseIns *);
+u_int32_t MYSQL_ManualConnect(DatabaseData *, uint8_t);
+u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *, uint8_t);
 
-void resetTransactionState(dbReliabilityHandle *pdbRH);
-void setTransactionState(dbReliabilityHandle *pdbRH);
-void setTransactionCallFail(dbReliabilityHandle *pdbRH);
+void resetTransactionState(DatabaseIns *);
+void setTransactionState(DatabaseIns *);
+void setTransactionCallFail(DatabaseIns *);
 
-u_int32_t getReconnectState(dbReliabilityHandle *pdbRH);
-void setReconnectState(dbReliabilityHandle *pdbRH, u_int32_t reconnection_state);
+u_int32_t getReconnectState(DatabaseIns *);
+void setReconnectState(DatabaseIns *, u_int32_t);
 
-void DatabaseCleanSelect(DatabaseData *data);
-void DatabaseCleanInsert(DatabaseData *data);
+void DatabaseCleanSelect(DatabaseData *data, uint8_t q_sock);
+void DatabaseCleanInsert(DatabaseData *data, uint8_t q_sock);
 
-void Connect(DatabaseData * data);
-void Disconnect(DatabaseData * data);
+void Connect(DatabaseData *, uint8_t);
+void Disconnect(DatabaseData *, uint8_t);
 
 u_int32_t ConvertDefaultCache(Barnyard2Config *bc, DatabaseData *data);
 u_int32_t CacheSynchronize(DatabaseData *data);
@@ -747,16 +791,15 @@ u_int32_t cacheEventClassificationLookup(cacheClassificationObj *iHead,
 		u_int32_t iClass_id);
 u_int32_t cacheEventSignatureLookup(cacheSignatureObj *iHead,
 		plgSignatureObj *sigContainer, u_int32_t gid, u_int32_t sid);
-u_int32_t SignatureCacheInsertObj(dbSignatureObj *iSigObj,
-		MasterCache *iMasterCache, u_int32_t from);
+cacheSignatureObj* SignatureCacheInsertObj(dbSignatureObj *iSigObj,
+		MasterCache *iMasterCache, u_int32_t from, uint32_t ha_idx);
 u_int32_t SignaturePopulateDatabase(DatabaseData *data,
-		cacheSignatureObj *cacheHead, int inTransac);
-u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj);
+		cacheSignatureObj *cacheHead, int inTransac, uint8_t q_sock);
+u_int32_t SignatureLookupDatabase(DatabaseData *data, dbSignatureObj *sObj, uint8_t q_sock);
 void MasterCacheFlush(DatabaseData *data, u_int32_t flushFlag);
 
 u_int32_t dbConnectionStatusPOSTGRESQL(dbReliabilityHandle *pdbRH);
 u_int32_t dbConnectionStatusODBC(dbReliabilityHandle *pdbRH);
-u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *pdbRH);
 
 #ifdef ENABLE_ODBC
 void ODBCPrintError(DatabaseData *data,SQLSMALLINT iSTMT_type);

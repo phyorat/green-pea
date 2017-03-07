@@ -53,63 +53,64 @@ int dbProcessGetTimeStamp(DatabaseData *data, Unified2EventCommon *event, Packet
 	return 0;
 }
 
-static int dbProcessEncodePayload(DatabaseData *data, Packet *p)
+static int dbProcessEncodePayload(DatabaseData *data, Packet *p, uint8_t q_ins)
 {
 	if (data->encoding == ENCODING_BASE64) {
 		if (base64_STATIC(p->data, p->dsize,
-				data->PacketDataNotEscaped)) {
+				data->PacketDataNotEscaped[q_ins])) {
 			return 1;
 		}
 	} else if (data->encoding == ENCODING_ASCII) {
 		if (ascii_STATIC(p->data, p->dsize,
-				data->PacketDataNotEscaped)) {
+				data->PacketDataNotEscaped[q_ins])) {
 			return 1;
 		}
 	} else {
 		if ((fasthex_STATIC(p->data, p->dsize,
-				data->PacketDataNotEscaped))) {
+				data->PacketDataNotEscaped[q_ins]))) {
 			return 1;
 		}
 	}
 
-	if (snort_escape_string_STATIC( data->PacketDataNotEscaped,
-			strlen(data->PacketDataNotEscaped) + 1, data)) {
+	if (snort_escape_string_STATIC( data->PacketDataNotEscaped[q_ins], data->sanitize_buffer[q_ins],
+			strlen(data->PacketDataNotEscaped[q_ins]) + 1, data)) {
 		return 1;
 	}
 
 	return 0;
 }
 
-static int dbProcessEncodeRaw(DatabaseData *data, void *raw, uint32_t rawlen)
+static int dbProcessEncodeRaw(DatabaseData *data, void *raw, uint32_t rawlen, uint8_t q_ins)
 {
     if (data->encoding == ENCODING_BASE64) {
         if (base64_STATIC(raw, rawlen,
-                data->PacketDataNotEscaped)) {
+                data->PacketDataNotEscaped[q_ins])) {
             return 1;
         }
     } else if (data->encoding == ENCODING_ASCII) {
         if (ascii_STATIC(raw, rawlen,
-                data->PacketDataNotEscaped)) {
+                data->PacketDataNotEscaped[q_ins])) {
             return 1;
         }
     } else {
         if ((fasthex_STATIC(raw, rawlen,
-                data->PacketDataNotEscaped))) {
+                data->PacketDataNotEscaped[q_ins]))) {
             return 1;
         }
     }
 
-    if (snort_escape_string_STATIC( data->PacketDataNotEscaped,
-            strlen(data->PacketDataNotEscaped) + 1, data)) {
+    if (snort_escape_string_STATIC( data->PacketDataNotEscaped[q_ins], data->sanitize_buffer[q_ins],
+            strlen(data->PacketDataNotEscaped[q_ins]) + 1, data)) {
         return 1;
     }
 
     return 0;
 }
 
-static unsigned long dbProcessEscapeRaw(DatabaseData *data, void *raw, uint32_t rawlen)
+static unsigned long dbProcessEscapeRaw(DatabaseData *data, void *raw, uint32_t rawlen, uint8_t q_ins)
 {
-    return mysql_real_escape_string(data->m_sock, data->sanitize_buffer, raw, rawlen);
+    //return mysql_real_escape_string(data->m_dbins[SPO_DB_DEF_INS].m_sock, data->sanitize_buffer, raw, rawlen);
+    return mysql_escape_string(data->sanitize_buffer[q_ins], raw, rawlen);
 }
 
 uint8_t dbEventInfoFm_tsp(char *buf, int slen)
@@ -333,7 +334,15 @@ uint8_t dbEventInfoFm_tcpopt(char *buf, int slen)
 	return 1;
 }
 
-uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data, SQLQueryEle *squery, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator)
+uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data,
+        SQLQueryEle *squery,
+        int slen,
+        int sid,
+        uint8_t rid,
+        us_cid_t cid,
+        Packet *p,
+        char sl_separator,
+        uint8_t q_ins)
 {
 	char sl_separ_end = sl_separator;
 	uint8_t i;
@@ -347,13 +356,13 @@ uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data, SQLQueryEle *squery, int sl
 		if ((data->encoding == ENCODING_HEX)
 				|| (data->encoding == ENCODING_ASCII)) {
 			if (fasthex_STATIC(p->tcp_options[i].data,
-					p->tcp_options[i].len, data->PacketData)) {
+					p->tcp_options[i].len, data->PacketData[q_ins])) {
 				LogMessage("%s: fasthex_STATIC Failed\n", __func__);
 				return 0;
 			}
 		} else {
 			if (base64_STATIC(p->tcp_options[i].data,
-					p->tcp_options[i].len, data->PacketData)) {
+					p->tcp_options[i].len, data->PacketData[q_ins])) {
 				LogMessage("%s: base64_STATIC Failed\n", __func__);
 				return 0;
 			}
@@ -370,7 +379,7 @@ uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data, SQLQueryEle *squery, int sl
 			if ( SnortSnprintf(sl_buf, sizeof(sl_buf),
 					"%c(%u,%u,%lu,%u,%u,%u,%u,:1)|%s", sl_separ_end,	//??????????????????WTF
 					sid, rid, cid, i, 6,
-					p->tcp_options[i].code, p->tcp_options[i].len, data->PacketData)
+					p->tcp_options[i].code, p->tcp_options[i].len, data->PacketData[q_ins])
 					!= SNORT_SNPRINTF_SUCCESS) {
 				LogMessage("%s: SnortSnprintf Failed\n", __func__);
 				return 0;
@@ -380,7 +389,7 @@ uint8_t dbEventInfoFm_tcpoptdata(DatabaseData *data, SQLQueryEle *squery, int sl
 			if ((SnortSnprintf(sl_buf, sizeof(sl_buf),
 					"%c(%u,%u,%lu,%u,%u,%u,%u,'%s')", sl_separ_end,
 					sid, rid, cid, i, 6,
-					p->tcp_options[i].code, p->tcp_options[i].len, data->PacketData))
+					p->tcp_options[i].code, p->tcp_options[i].len, data->PacketData[q_ins]))
 					!= SNORT_SNPRINTF_SUCCESS) {
 				LogMessage("%s: SnortSnprintf Failed\n", __func__);
 				return 0;
@@ -462,7 +471,15 @@ uint8_t dbEventInfoFm_ipopt(char *buf, int slen)
 	return 1;
 }
 
-uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data, SQLQueryEle *squery, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator)
+uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data,
+        SQLQueryEle *squery,
+        int slen,
+        int sid,
+        uint8_t rid,
+        us_cid_t cid,
+        Packet *p,
+        char sl_separator,
+        uint8_t q_ins)
 {
 	char sl_separ_end = sl_separator;
 	uint8_t i;
@@ -477,13 +494,13 @@ uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data, SQLQueryEle *squery, int sle
 		if ((data->encoding == ENCODING_HEX)
 				|| (data->encoding == ENCODING_ASCII)) {
 			if (fasthex_STATIC(p->ip_options[i].data,
-					p->ip_options[i].len, data->PacketData)) {
+					p->ip_options[i].len, data->PacketData[q_ins])) {
 				LogMessage("%s: fasthex_STATIC Failed\n", __func__);
 				return 0;
 			}
 		} else {
 			if (base64_STATIC(p->ip_options[i].data,
-					p->ip_options[i].len, data->PacketData)) {
+					p->ip_options[i].len, data->PacketData[q_ins])) {
 				LogMessage("%s: base64_STATIC Failed\n", __func__);
 				return 0;
 			}
@@ -498,7 +515,7 @@ uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data, SQLQueryEle *squery, int sle
 			if ((SnortSnprintf(sl_buf, sizeof(sl_buf),
 					"(%u,%u,%lu,%u,%u,%u,%u,:1)%c|%s",	//??????????????????WTF
 					sid, rid, cid, i, 0,
-					p->ip_options[i].code, p->ip_options[i].len, sl_separ_end, data->PacketData))
+					p->ip_options[i].code, p->ip_options[i].len, sl_separ_end, data->PacketData[q_ins]))
 					!= SNORT_SNPRINTF_SUCCESS) {
 				LogMessage("%s: SnortSnprintf Failed\n", __func__);
 				return 0;
@@ -508,7 +525,7 @@ uint8_t dbEventInfoFm_ipoptdata(DatabaseData *data, SQLQueryEle *squery, int sle
 			if ((SnortSnprintf(sl_buf, sizeof(sl_buf),
 					"%c(%u,%u,%lu,%u,%u,%u,%u,'%s')",
 					sl_separ_end, sid, rid, cid, i, 0,
-					p->ip_options[i].code, p->ip_options[i].len, data->PacketData))
+					p->ip_options[i].code, p->ip_options[i].len, data->PacketData[q_ins]))
 					!= SNORT_SNPRINTF_SUCCESS) {
 				LogMessage("%s: SnortSnprintf Failed\n", __func__);
 				return 0;
@@ -535,10 +552,18 @@ uint8_t dbEventInfoFm_payload(char *buf, int slen)
 	return 1;
 }
 
-uint8_t dbEventInfoFm_payloaddata(DatabaseData *data, char *sbuf, int slen, int sid, uint8_t rid, us_cid_t cid, Packet *p, char sl_separator)
+uint8_t dbEventInfoFm_payloaddata(DatabaseData *data,
+        char *sbuf,
+        int slen,
+        int sid,
+        uint8_t rid,
+        us_cid_t cid,
+        Packet *p,
+        char sl_separator,
+        uint8_t q_ins)
 {
-	dbProcessEncodePayload(data, p);
-	dbProcessEncodeRaw(data, p, 1);
+	dbProcessEncodePayload(data, p, q_ins);
+	dbProcessEncodeRaw(data, p, 1, q_ins);
 
 	switch (data->dbtype_id) {
 	case DB_ORACLE:
@@ -549,7 +574,7 @@ uint8_t dbEventInfoFm_payloaddata(DatabaseData *data, char *sbuf, int slen, int 
 		if ((SnortSnprintf(sbuf, slen,
 				"(%u,%u,%lu,%u:1)%c|%s",
 				//sid, cid, sl_separator, data->PacketDataNotEscaped))
-				sid, rid, cid, 1, sl_separator, data->PacketDataNotEscaped))
+				sid, rid, cid, 1, sl_separator, data->PacketDataNotEscaped[q_ins]))
 				!= SNORT_SNPRINTF_SUCCESS) {
 			LogMessage("%s: Failed\n", __func__);
 			return 0;
@@ -559,7 +584,7 @@ uint8_t dbEventInfoFm_payloaddata(DatabaseData *data, char *sbuf, int slen, int 
 		if ((SnortSnprintf(sbuf, slen,
 				"(%u,%u,%lu,%u,'%s')%c",
 				//sid, cid, data->sanitize_buffer, sl_separator))
-		        sid, rid, cid, 1, data->sanitize_buffer, sl_separator))
+		        sid, rid, cid, 1, data->sanitize_buffer[q_ins], sl_separator))
 				!= SNORT_SNPRINTF_SUCCESS) {
 			LogMessage("%s: Failed\n", __func__);
 			return 0;
@@ -582,14 +607,18 @@ uint8_t dbEventInfoFm_raw(char *buf, int slen)
     return 1;
 }
 
-uint8_t dbEventInfoFm_rawdata(DatabaseData *data, char *sbuf, int slen, int sid, uint8_t rid, us_cid_t cid, SQLPkt *adp, char sl_separator)
+uint8_t dbEventInfoFm_rawdata(DatabaseData *data,
+        char *sbuf, int slen,
+        int sid, uint8_t rid, us_cid_t cid,
+        SQLPkt *adp, char sl_separator,
+        uint8_t q_ins)
 {
     int len;
     char in_buf[8];
     PROTO_ID proto = PROTO_ETH; //default
 
     //dbProcessEncodeRaw(data, adp->u2raw_data, adp->u2raw_datalen);
-    adp->u2raw_esc_len = dbProcessEscapeRaw(data, adp->u2raw_data, adp->u2raw_datalen);
+    adp->u2raw_esc_len = dbProcessEscapeRaw(data, adp->u2raw_data, adp->u2raw_datalen, q_ins);
 
     if (adp->p->next_layer > 0) {
         proto = adp->p->layers[adp->p->next_layer-1].proto;
@@ -604,7 +633,7 @@ uint8_t dbEventInfoFm_rawdata(DatabaseData *data, char *sbuf, int slen, int sid,
         if ((SnortSnprintf(sbuf, slen,
                 "(%u,%u,%lu,%u,%u:1)%c|%s",
                 //sid, cid, sl_separator, data->PacketDataNotEscaped))
-                sid, rid, cid, proto, adp->p->dp, sl_separator, data->PacketDataNotEscaped))
+                sid, rid, cid, proto, adp->p->dp, sl_separator, data->PacketDataNotEscaped[q_ins]))
                 != SNORT_SNPRINTF_SUCCESS) {
             LogMessage("%s: Failed\n", __func__);
             return 0;
@@ -621,7 +650,7 @@ uint8_t dbEventInfoFm_rawdata(DatabaseData *data, char *sbuf, int slen, int sid,
         }
 
         len = strlen(sbuf);
-        memcpy(sbuf+len, data->sanitize_buffer, adp->u2raw_esc_len);
+        memcpy(sbuf+len, data->sanitize_buffer[q_ins], adp->u2raw_esc_len);
         len += adp->u2raw_esc_len;
 
         if ((SnortSnprintf(in_buf, sizeof(in_buf),

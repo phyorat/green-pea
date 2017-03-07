@@ -1885,7 +1885,7 @@ void DecodeICMP(const uint8_t * pkt, const uint32_t len, Packet * p)
     }
 
 
-    uint16_t csum = in_chksum_icmp((uint16_t *)p->icmph, len);
+    uint16_t csum = 0;//in_chksum_icmp((uint16_t *)p->icmph, len);
 
     if(csum)
     {
@@ -2540,19 +2540,19 @@ void DecodeICMP6(const uint8_t *pkt, const uint32_t len, Packet *p)
 
     if(IS_IP4(p))
     {
-        csum = in_chksum_icmp((uint16_t *)(p->icmp6h), len);
+        csum = 0;//in_chksum_icmp((uint16_t *)(p->icmp6h), len);
     }
     /* IPv6 traffic */
     else
     {
-        pseudoheader6 ph6;
+/*        pseudoheader6 ph6;
         COPY4(ph6.sip, p->ip6h->ip_src.ip32);
         COPY4(ph6.dip, p->ip6h->ip_dst.ip32);
         ph6.zero = 0;
         ph6.protocol = GET_IPH_PROTO(p);
-        ph6.len = htons((u_short)len);
+        ph6.len = htons((u_short)len);*/
 
-        csum = in_chksum_icmp6(&ph6, (uint16_t *)(p->icmp6h), len);
+        csum = 0;//in_chksum_icmp6(&ph6, (uint16_t *)(p->icmp6h), len);
     }
     if(csum)
     {
@@ -3540,20 +3540,19 @@ void DecodeUDP(const uint8_t * pkt, const uint32_t len, Packet * p)
     uint16_t csum;
     if(IS_IP4(p))
     {
-        pseudoheader ph;
+/*        pseudoheader ph;
         ph.sip = *p->ip4h->ip_src.ip32;
         ph.dip = *p->ip4h->ip_dst.ip32;
         ph.zero = 0;
         ph.protocol = GET_IPH_PROTO(p);
-        ph.len = p->udph->uh_len;
+        ph.len = p->udph->uh_len;*/
         /* Don't do checksum calculation if
          * 1) Fragmented, OR
          * 2) UDP header chksum value is 0.
          */
         if( !fragmented_udp_flag && p->udph->uh_chk )
         {
-            csum = in_chksum_udp(&ph,
-                (uint16_t *)(p->udph), uhlen);
+            csum = 0;//in_chksum_udp(&ph, (uint16_t *)(p->udph), uhlen);
         }
         else
         {
@@ -3562,12 +3561,12 @@ void DecodeUDP(const uint8_t * pkt, const uint32_t len, Packet * p)
     }
     else
     {
-        pseudoheader6 ph6;
+/*        pseudoheader6 ph6;
         COPY4(ph6.sip, p->ip6h->ip_src.ip32);
         COPY4(ph6.dip, p->ip6h->ip_dst.ip32);
         ph6.zero = 0;
         ph6.protocol = GET_IPH_PROTO(p);
-        ph6.len = htons((u_short)len);
+        ph6.len = htons((u_short)len);*/
 
         /* Alert on checksum value 0 for ipv6 packets */
         if(!p->udph->uh_chk)
@@ -3580,8 +3579,7 @@ void DecodeUDP(const uint8_t * pkt, const uint32_t len, Packet * p)
          */
         else if( !fragmented_udp_flag )
         {
-            csum = in_chksum_udp6(&ph6,
-                (uint16_t *)(p->udph), uhlen);
+            csum = 0;//in_chksum_udp6(&ph6, (uint16_t *)(p->udph), uhlen);
         }
         else
         {
