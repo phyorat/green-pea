@@ -39,12 +39,15 @@
 
 #include <sys/mman.h>
 
+#include <mn_mem_schedule.h>
+
 #include "squirrel.h"
 #include "debug.h"
 #include "plugbase.h"
 #include "spooler.h"
 #include "unified2.h"
 #include "util.h"
+
 
 by_mul_tread_para bmt_para;
 pthread_t tid_i[BY_MUL_TR_DEFAULT];
@@ -66,6 +69,7 @@ int spoolerWriteWaldo(Waldo *, uint8_t);
 int spoolerOpenWaldo(Waldo *, uint8_t);
 int spoolerCloseWaldo(Waldo *);
 
+#ifdef SPO_ANCIENT_PATH
 int spoolerPacketCacheAdd(Spooler *, Packet *);
 int spoolerPacketCacheClear(Spooler *);
 
@@ -73,6 +77,7 @@ int spoolerEventCachePush(Spooler *, uint32_t, void *, uint32_t, uint32_t);
 EventRecordNode * spoolerEventCacheGetByEventID(Spooler *, uint32_t, uint32_t);
 EventRecordNode * spoolerEventCacheGetHead(Spooler *);
 uint8_t spoolerEventCacheHeadUsed(Spooler *);
+#endif
 int spoolerEventCacheClean(Spooler *);
 
 /* Find the next spool file timestamp extension with a value equal to or 
@@ -442,7 +447,8 @@ int spoolerReadRecordHeader(Spooler *spooler)
 
 int spoolerReadRecord(Spooler *spooler)
 {
-    int ret;
+    int ret = 0;
+#ifdef SPO_ANCIENT_PATH
 
     /* perform sanity checks */
     if (spooler == NULL)
@@ -472,6 +478,7 @@ int spoolerReadRecord(Spooler *spooler)
                 spooler->timestamp;
     }
 
+#endif
     return ret;
 }
 
@@ -772,6 +779,207 @@ int ProcessContinuous(Waldo *waldo, spooler_r_para *sr_para)
     return pc_ret;
 }
 
+#ifdef SPO_MPOOL_RING
+static int spoolerMbufCheckRelease(EventSpoMR *sr_mr, uint64_t *mr_sum, uint8_t if_log)
+{
+#define ENODE_BUF_DEQUEUE   64
+    uint8_t rid;
+    unsigned mbuf_i;
+    unsigned mbuf_ret_count;
+    EventGMCid u_cids[BY_MUL_TR_DEFAULT];
+    EventMBuf* eNodeBufDone[ENODE_BUF_DEQUEUE];
+
+    mbuf_ret_count = rte_ring_dequeue_burst(sr_mr->ring_ret, (void**)&eNodeBufDone, ENODE_BUF_DEQUEUE);
+    if ( mbuf_ret_count > 0 ) {
+        memset(u_cids, 0, sizeof(u_cids));
+        for ( mbuf_i=0; mbuf_i<mbuf_ret_count; mbuf_i++ ) {
+            if ( UNIFIED2_PACKET != eNodeBufDone[mbuf_i]->type ) {
+                rid = eNodeBufDone[mbuf_i]->bid;
+                if ( eNodeBufDone[mbuf_i]->cid > u_cids[rid].cid )
+                    u_cids[rid].cid = eNodeBufDone[mbuf_i]->cid;
+            }
+        }
+        CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, u_cids, UNIFIED2_IDS_SET_CIDS);
+        rte_mempool_put_bulk(sr_mr->dp_mpool, (void**)&eNodeBufDone, mbuf_ret_count);
+        *mr_sum += mbuf_ret_count;
+        if ( if_log ) {
+            LogMessage("%s: Get (sum %lu) mempools %u, wait for new transfer.\n", __func__,
+                    *mr_sum, mbuf_ret_count);
+        }
+    }
+    else if ( rte_mempool_full(sr_mr->dp_mpool) ) {
+        if ( if_log ) {
+            LogMessage("%s: mempool full(sum %lu), wait for new transfer.\n", __func__,
+                    *mr_sum);
+        }
+    }
+    else {
+        if ( if_log ) {
+            LogMessage("%s: no mempool ret(sum %lu), available count %u.\n", __func__,
+                    *mr_sum, rte_mempool_avail_count(sr_mr->dp_mpool));
+        }
+    }
+
+    if ( ENODE_BUF_DEQUEUE > mbuf_ret_count ) {
+        usleep(1);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+static inline uint8_t user_rte_get_huge_maps()
+{
+    uint8_t numa_maps_c;
+    FILE *fp;
+    char line[256];
+
+    numa_maps_c = 0;
+    fp = popen("for i in $(pgrep minerva); "
+            "do cat /proc/$i/numa_maps |grep -e '/mnt/huge/rtemap_0'"
+            " | awk '{print $4}'; done", "r");
+    if (NULL != fp)
+    {
+        while (fgets(line, sizeof(line), fp) != NULL) {
+            if ( !strncmp(line, "huge", 4) )
+                numa_maps_c++;
+        }
+        pclose(fp);
+    }
+    return numa_maps_c;
+}
+
+static int spooler_wait_rte(void)
+{
+    uint8_t numa_maps_c;
+
+    LogMessage("%s: waiting for RTE_EAL.\n", __func__);
+
+    do {
+        numa_maps_c = user_rte_get_huge_maps();
+        if ( 0 < numa_maps_c )
+            break;
+        if ( 0 != exit_signal )
+            return 1;
+
+        LogMessage("%s: RTE_EAL not active, waiting\n", __func__);
+        sleep(1);
+    } while(1);
+
+    return 0;
+}
+
+#ifdef SPO_MPOOL_RING
+static inline int squr_msg_send(EventSpoMR *eve_sp, void *sq_msg)
+{
+    int ret;
+
+    do {
+        ret = rte_ring_enqueue(eve_sp->ring_master, sq_msg);
+        if ( 0 == ret ) {
+            break;
+        }
+        else if ( -ENOBUFS == ret ) {
+            LogMessage("%s: ring full for msg to master, try again\n", __func__);
+        }
+        else if ( -EDQUOT == ret ) {
+            LogMessage("%s: Quota exceeded msg to master\n", __func__);
+            return 1;
+        }
+        sleep(1);
+    } while(1);
+
+    return 0;
+}
+
+static int spooler_reinit_mpool(EventSpoMR *eve_sp)
+{
+    uint64_t snd_mb_cnt;
+    daq_dp_ap_msg *sq_msg;
+    EventMBuf *mb_eve[SP_RING_SND_CNT];
+    uint64_t sq_msg_seq;
+
+    if ( !rte_mempool_full(eve_sp->dp_mpool) ) {
+        LogMessage("%s: mpool not full, wait for msg from master\n", __func__);
+
+        //Check if mbuf in ring-snd, and clear it
+        if ( !rte_ring_empty(eve_sp->ring_snd) ) {
+            snd_mb_cnt = 0;
+            do {
+                if ( rte_ring_dequeue_burst(eve_sp->ring_snd, (void**)&mb_eve, SP_RING_SND_CNT) )
+                    break;
+                //No Need to put them since we will re-init it, just in-case someone(portrait) still using it.
+                //rte_mempool_put(eve_sp->dp_mpool, mb_eve);
+                snd_mb_cnt++;
+            } while(1);
+            LogMessage("%s: clear ring_snd elements %u\n", __func__, snd_mb_cnt);
+        }
+        if ( !rte_ring_empty(eve_sp->ring_ret) ) {
+            snd_mb_cnt = 0;
+            spoolerMbufCheckRelease(eve_sp, &snd_mb_cnt, 1);
+            LogMessage("%s: sync ring_rsv elements %u\n", __func__, snd_mb_cnt);
+        }
+
+        //Get one msg from master
+        do {
+            if ( !rte_ring_dequeue(eve_sp->ring_msg, (void**)&sq_msg) )
+                break;
+        } while(1);
+
+        //setup msg and send to master
+        LogMessage("%s: Got(first strick) msg_sequence %lu\n", __func__,
+                sq_msg->st_seq);
+        sq_msg->st_seq = MSG_MP_RESET;
+        sq_msg->res_flag = DAQ_DPDK_DP_SQ_REIN;
+        if ( squr_msg_send(eve_sp, sq_msg) )
+            return 1;
+
+        //wait for msg from master, see mpool is ready.
+        do {
+            if ( !rte_ring_dequeue(eve_sp->ring_msg, (void**)&sq_msg) ) {
+                sq_msg_seq = sq_msg->st_seq;
+                if ( squr_msg_send(eve_sp, sq_msg) )
+                    return 1;
+
+                LogMessage("%s: Got msg_sequence %lu\n", __func__,
+                        sq_msg_seq);
+
+                if ( MSG_SEQ_READY == sq_msg_seq )
+                    break;
+                else
+                    continue;
+            }
+
+            LogMessage("%s: waiting for master (re)init mpools.\n", __func__);
+            sleep(1);
+        } while(1);
+    }
+
+    if ( !rte_mempool_full(eve_sp->dp_mpool) ) {
+        LogMessage("%s: mpool still not full, [%u]?\n", __func__,
+                rte_mempool_avail_count(eve_sp->dp_mpool));
+        return 1;
+    }
+
+    LogMessage("%s: mpool reinit succeed, available count %u!\n", __func__,
+            rte_mempool_avail_count(eve_sp->dp_mpool));
+    return 0;
+}
+
+static int spooler_echo_msg(EventSpoMR *eve_sp)
+{
+    daq_dp_ap_msg *sq_msg;
+
+    if ( !rte_ring_dequeue(eve_sp->ring_msg, (void**)&sq_msg) ) {
+        //LogMessage("%s: echo msg sequence: %lu\n", __func__, sq_msg->st_seq);
+        if ( !squr_msg_send(eve_sp, sq_msg) )
+            return 0;
+    }
+
+    return 1;
+}
+#endif  /*End of SPO_MPOOL_RING*/
+
 int ProcessContinuousWithWaldo(Barnyard2Config *bc)
 {
 #ifndef SPOOLER_DUAL_THREAD
@@ -782,6 +990,100 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
     static pthread_once_t spool_once = PTHREAD_ONCE_INIT;
     pthread_t  *ptid;
     EventGMCid ret_mcid;
+#endif
+
+#ifdef SPO_MPOOL_RING
+#define SPO_MPOOL_INIT_ARGV_LEN 128
+    EventSpoMR eveSpoR;
+    uint64_t mbuf_check_int = 0, mbuf_restore_sum = 0;
+    char *dpdk_argv[8] = {0};
+    uint32_t echo_msg_miss_cnt = 0;
+
+    //wait for rte_ready.
+    if ( spooler_wait_rte() )
+        return 0;
+
+    for (i = 0; i < 8; i++) {
+        dpdk_argv[i] = (char*)malloc(SPO_MPOOL_INIT_ARGV_LEN);
+        if( NULL == dpdk_argv[i] )
+            return 0;
+        memset(dpdk_argv[i], 0, SPO_MPOOL_INIT_ARGV_LEN);
+    }
+
+    strcpy(dpdk_argv[0], "squirrel");
+    strcpy(dpdk_argv[1], "-c");
+    if ( bc->mr_lcore > 0 ) {
+        snprintf(dpdk_argv[2], SPO_MPOOL_INIT_ARGV_LEN, "%lx", bc->mr_lcore);
+    }
+    else {
+        LogMessage("%s: invalid lcore appointment.\n", __func__);
+        return 0;
+    }
+    strcpy(dpdk_argv[3], "-n");
+    strcpy(dpdk_argv[4], "2");
+    strcpy(dpdk_argv[5], "--proc-type=secondary");
+    rte_eal_init(6, (char**)dpdk_argv);
+
+    //Wait for dp_mpool_ring ready
+    do {
+        if ( NULL != (eveSpoR.dp_mpool=rte_mempool_lookup(DAQ_DP_MP_EVN_PT)) )
+            break;
+        if ( 0 != exit_signal )
+            return 0;
+
+        LogMessage("%s: waiting mpool_buf for event transfer.\n", __func__);
+        sleep(1);
+    } while(1);
+    do {
+        if ( NULL != (eveSpoR.ring_snd=rte_ring_lookup(DAQ_DP_RING_SQ_SND)) )
+            break;
+        if ( 0 != exit_signal )
+            return 0;
+
+        LogMessage("%s: waiting ring for event transfer.\n", __func__);
+        sleep(1);
+    } while(1);
+
+    do {
+        if ( NULL != (eveSpoR.ring_ret=rte_ring_lookup(DAQ_DP_RING_SQ_RSV)) )
+            break;
+        if ( 0 != exit_signal )
+            return 0;
+
+        LogMessage("%s: waiting ring for mbuf restore.\n", __func__);
+        sleep(1);
+    } while(1);
+
+    do {
+        if ( NULL != (eveSpoR.ring_master=rte_ring_lookup(DAQ_DP_RING_MASTER)) )
+            break;
+        if ( 0 != exit_signal )
+            return 0;
+
+        LogMessage("%s: waiting ring for master.\n", __func__);
+        sleep(1);
+    } while(1);
+
+    do {
+        if ( NULL != (eveSpoR.ring_msg=rte_ring_lookup(DAQ_DP_RING_MSG_SQ)) )
+            break;
+        if ( 0 != exit_signal )
+            return 0;
+
+        LogMessage("%s: waiting ring for message to master.\n", __func__);
+        sleep(1);
+    } while(1);
+
+    for (i = 0; i < 8; i++) {
+        //free(dpdk_argv[i]);
+    }
+
+    //Check if mpool full
+    if ( spooler_reinit_mpool(&eveSpoR) )
+        return 0;
+
+    //setup spo-mpool-ring
+    CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, &eveSpoR, UNIFIED2_IDS_SET_RINGS);
 #endif
 
     /*    if (waldo == NULL)
@@ -842,6 +1144,12 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
             goto pexit;
         }
         memset(bmt_para.s_para[i].sring, 0, sizeof(spooler_ring));
+
+#ifdef SPO_MPOOL_RING
+        bmt_para.s_para[i].eNodeMpool = eveSpoR.dp_mpool;
+        bmt_para.s_para[i].eNodeRing = eveSpoR.ring_snd;
+        bmt_para.s_para[i].eNodeRingRet = eveSpoR.ring_ret;
+#endif
 
         ret_mcid.rid = i;
         CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, &ret_mcid, UNIFIED2_IDS_GET_MCID);
@@ -908,6 +1216,31 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
         ptid = &(tid_i[i]);
     }
 
+    //Restore Mbuf
+#ifdef SPO_MPOOL_RING
+    do {
+        if ( 0x2000000 == (mbuf_check_int&0x3ffffff) ) {
+            while (spoolerMbufCheckRelease(&eveSpoR, &mbuf_restore_sum, 1));
+            //Check msg from master
+            if ( spooler_echo_msg(&eveSpoR) )
+                echo_msg_miss_cnt++;
+            else
+                echo_msg_miss_cnt = 0;
+        }
+        else if ( 0x200 == (mbuf_check_int&0x3ff) ) {
+            while (spoolerMbufCheckRelease(&eveSpoR, &mbuf_restore_sum, 0));
+        }
+        mbuf_check_int++;
+
+        //if we missed too much msg from master, stop loop.
+        if ( echo_msg_miss_cnt > 10 ) {
+            LogMessage("%s: lost too much(%u) msg from master, SIGQUIT.\n",
+                    __func__, echo_msg_miss_cnt);
+            exit_signal = SIGQUIT;
+        }
+    } while( 0 == exit_signal );
+#endif
+
     /* Join i/o threads */
     LogMessage("pthread_join will tid_o: %u!\n", *ptid);
     if ( 0 != pthread_join(*ptid, NULL) )
@@ -918,6 +1251,16 @@ int ProcessContinuousWithWaldo(Barnyard2Config *bc)
 pexit:
     for (i = 0; i < BY_MUL_TR_DEFAULT; i++) {
         if (NULL != bmt_para.s_para[i].sring) {
+#ifdef SPO_MPOOL_RING
+            spooler_r_para *sr_para = &(bmt_para.s_para[i]);
+            EventRecordNode *eNode;
+            while ( !SPOOLER_RING_EMPTY(sr_para->sring) ) {
+                eNode = &(sr_para->sring->event_cache[sr_para->sring->event_top]);
+                rte_mempool_put(eveSpoR.dp_mpool, eNode->mbuf_data);
+                SPOOLER_RING_DEC(sr_para);
+            }
+#endif
+
             ret_mcid.rid = i;
             ret_mcid.ms_cid = bmt_para.s_para[i].sring->base_eventid;
             CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, &ret_mcid, UNIFIED2_IDS_SET_MCID);
@@ -932,6 +1275,21 @@ pexit:
         }
     }
 
+#ifdef SPO_MPOOL_RING
+    LogMessage("%s: exiting, wait for mpool restoring(5s)!\n", __func__);
+    mbuf_check_int = 5;
+    do {
+        if ( rte_ring_empty(eveSpoR.ring_snd) && rte_ring_empty(eveSpoR.ring_ret) )
+            break;
+
+        while (spoolerMbufCheckRelease(&eveSpoR, &mbuf_restore_sum, 1));
+
+        sleep(1);
+    } while ( mbuf_check_int-- );//!rte_mempool_full(eveSpoR.dp_mpool) );
+    LogMessage("%s: mpool restored(available %u), mbuf_takeoff_sum %lu!\n", __func__,
+            rte_mempool_avail_count(eveSpoR.dp_mpool), mbuf_restore_sum);
+#endif
+
     return 0;
 #endif
 }
@@ -942,6 +1300,7 @@ pexit:
 
 void spoolerProcessRecord(Spooler *spooler, int fire_output)
 {
+#ifdef SPO_ANCIENT_PATH
     struct pcap_pkthdr pkth;
     uint32_t type;
     EventRecordNode *ernCache;
@@ -1166,6 +1525,7 @@ void spoolerProcessRecord(Spooler *spooler, int fire_output)
 
     /* clean the cache out */
     spoolerEventCacheClean(spooler);
+#endif
 }
 
 void spool_mult_init(void)
@@ -1292,18 +1652,21 @@ spf_new:    //If there is newer file
  */
 void* spoolerRecordRead_T(void * arg)
 {
-    Spooler *spooler = NULL;
-    Spooler *spooler_new = NULL;
+#ifdef SPO_MPOOL_RING
+    uint8_t mbuf_drc;
+    uint64_t mbuf_get_count = 0, mbuf_put_count = 0, mbuf_enq_count = 0;
+#endif
     int read_rtn = BARNYARD2_SUCCESS;
-//    uint32_t extension = 0;
-    Waldo *waldo;
-    char *dirpath;
     uint32_t timestamp;
     u_int32_t waldo_timestamp;
     sigset_t set;
+    void *m_buf;
+    Waldo *waldo;
+    char *dirpath;
     spooler_r_para *sr_para = (spooler_r_para*) arg;
     EventRecordNode *ernCache;
-    //uint32_t ws_idx = 0;
+    Spooler *spooler = NULL;
+    Spooler *spooler_new = NULL;
 
     sigemptyset(&set);
     sigfillset(&set);
@@ -1379,7 +1742,7 @@ void* spoolerRecordRead_T(void * arg)
         //If Ring Full
         //if (SPOOLER_RING_FULL(sr_para->sring)) {
         if ( ! SPOOLER_RING_PROCEED(sr_para->sring) ) {
-            //LogMessage("%s:%d Spooler Ring is full.\n", __func__, sr_para->wid);
+            //LogMessage("%s:%d Spooler Ring is full.\n", __func__, sr_para->rid);
             if ( sr_para->sring->i_sleep_cnt++ > 50000 ) {   //sleep 50000 times
                 spoolerWriteWaldo(sr_para->waldo, 1);
                 sr_para->sring->i_sleep_cnt = 0;
@@ -1388,6 +1751,21 @@ void* spoolerRecordRead_T(void * arg)
             usleep(1);
             continue;
         }
+
+#ifdef SPO_MPOOL_RING
+        if ( rte_mempool_get(spooler->spara->eNodeMpool, (void**)&m_buf) < 0 ) {
+            LogMessage("%s: Failed to get spooler_event_mbuf\n", __func__);
+            sleep(1);
+            continue;
+        }
+        mbuf_get_count++;
+        spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].mbuf_data =
+                (EventMBuf*)m_buf;
+        spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].data =
+                ((EventMBuf*)m_buf)->data;
+        mbuf_drc = 0;
+#endif
+
         sr_para->sring->i_sleep_cnt = 0;
 
         //Read
@@ -1423,6 +1801,10 @@ void* spoolerRecordRead_T(void * arg)
             else if ( UNIFIED2_INVALID_REC != ernCache->type ){
                 DEBUG_U_WRAP(LogMessage("%s: Process record, idx: %d\n", __func__, spooler->record_idx));
                 SPOOLER_RING_INC(sr_para);
+#ifdef SPO_MPOOL_RING
+                mbuf_drc = 1;
+                mbuf_enq_count++;
+#endif
             }
             break;
         case BARNYARD2_RING_FULL:
@@ -1436,6 +1818,15 @@ void* spoolerRecordRead_T(void * arg)
             //continue to fresh
             break;
         }
+
+#ifdef SPO_MPOOL_RING
+        if ( !mbuf_drc ) {
+            rte_mempool_put(spooler->spara->eNodeMpool, m_buf);
+            mbuf_put_count++;
+        }
+        /*LogMessage("%s_%d: mbuf_get_count %lu, mbuf_put_count %lu, mbuf_enq_count %lu\n", __func__, sr_para->rid,
+                mbuf_get_count, mbuf_put_count, mbuf_enq_count);*/
+#endif
     }
 
     if ( NULL != sr_para->ptid_join ) {
@@ -1522,10 +1913,12 @@ void spoolerRingTopSync(by_mul_tread_para *pbmt_para, EventRingTopOcts *ele_rto)
     uint8_t sync = 0, mque_fi_prev = 0;
 
     while ( ele_rto->mque_fo != ele_rto->mque_fi ) {
+#ifndef SPO_MPOOL_RING
         if ( 1 == ele_rto->rings2mque[ele_rto->mque_fo].r_flag ) {
             //Keep producer and exit
             break;
         }
+#endif
 
         //Proceed To Next
         mque_fi_prev = ele_rto->mque_fo;
@@ -1571,10 +1964,16 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
     us_cid_t cur_eventid[BY_MUL_TR_DEFAULT];
 
     sigset_t s_set;
-    spooler_r_para *sr_para;
+    spooler_r_para *sr_para = NULL;
     by_mul_tread_para *pbmt_para = (by_mul_tread_para *) arg;
     struct timespec t_elapse;
     EventGMCid ret_mcid;
+#ifdef SPO_MPOOL_RING
+#ifdef SPO_MPOOL_DEBUG_LOG
+    uint64_t mbuf_check_int = 0;
+#endif
+    uint64_t mbuf_evn_cnt = 0, mbuf_put_cnt = 0;
+#endif
 
     sigemptyset(&s_set);
     sigfillset(&s_set);
@@ -1598,6 +1997,12 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
         }
         sr_para = &(pbmt_para->s_para[pbmt_idx]);
         pbmt_idx++;
+
+#ifdef SPO_MPOOL_DEBUG_LOG
+        if ( ((mbuf_check_int++&0x3fff)==0x2000) )
+            LogMessage("%s: mbuf_evn_cnt %lu, mbuf_put_cnt %lu\n", __func__,
+                    mbuf_evn_cnt, mbuf_put_cnt);
+#endif
 
         if (SPOOLER_RING_EMPTY(sr_para->sring)) {
             //LogMessage("%s: Spooler Ring is empty.\n", __func__);
@@ -1658,6 +2063,16 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
         enCaChe.rid = sr_para->rid;
         //LogMessage("%s: rid %d\n", __func__, enCaChe.rid);
         enCaChe.ee = &(sr_para->sring->event_cache[sr_para->sring->event_top]);
+
+#ifdef SPO_MPOOL_RING
+#if 0//def SPO_MPOOL_DEBUG
+        SPOOLER_RING_DEC(sr_para);
+        sr_para->sring->mr_flag = 1;
+        rte_mempool_put(sr_para->eNodeMpool, enCaChe.ee->mbuf_data);
+        continue;
+#endif
+#endif
+
         type = ntohl(((Unified2RecordHeader *) enCaChe.ee->header)->type);
 
         record_idx = enCaChe.ee->record_idx;
@@ -1683,9 +2098,14 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
             {
                 if (sr_para->sring->event_cnt < 2) {
                     nanosleep(&t_elapse, NULL);     //Sleep 1ns
+                    if ( !sr_para->sring->rlog_wp ) {
+                        LogMessage("%s[%d]: wait for packet appear\n", __func__, sr_para->rid);
+                        sr_para->sring->rlog_wp = 1;
+                    }
                     continue;                       //Continue with next ring, or not ?
                 }
 
+                sr_para->sring->rlog_wp = 0;
                 pc.total_events++;
 
                 //pEventData = enCaChe.ee->data;
@@ -1700,6 +2120,9 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
                         timestamp = enCaChe.ep->timestamp;
                         opt = OUTPUT_TYPE__SPECIAL;
                         pc.total_packets++;
+#ifdef SPO_MPOOL_RING
+                        mbuf_evn_cnt++;
+#endif
                     }
                 } else {
                     LogMessage("%s: event_cnt is %d\n", __func__, sr_para->sring->event_cnt);
@@ -1716,6 +2139,9 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
         }
         /* increment the stats */
         pc.total_records++;
+#ifdef SPO_MPOOL_RING
+        mbuf_evn_cnt++;
+#endif
 
         switch (opt) {
         case OUTPUT_TYPE__LOG: /* call output plugins with a "LOG" format (Packet information only) */
@@ -1729,12 +2155,23 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
                 DEBUG_U_WRAP_DEEP(LogMessage("%s: this is additional packet for previous event\n", __func__));
                 CallOutputPlugins(OUTPUT_TYPE__LOG, enCaChe.ep->s_pkt,
                         &enCaChe, enCaChe.ep->type);
+#ifdef SPO_MPOOL_RING
+                sr_para->sring->mr_flag = 1;
+#ifndef SPO_MPOOL_DEBUG
+                if ( enCaChe.ep->mbuf_turn2base )
+#endif
+                    rte_mempool_put(sr_para->eNodeMpool, enCaChe.ep->mbuf_data);
+#endif
             }
             else {
                 LogMessage("%s: this is wild packet(rid: %d, pkt: %lu, cur: %lu), skip it!\n", __func__,
                         enCaChe.rid, enCaChe.ep->event_id, cur_eventid[enCaChe.rid]);
 /*                CallOutputPlugins(OUTPUT_TYPE__LOG, enCaChe.ep->s_pkt,
                         NULL, 0);*/
+#ifdef SPO_MPOOL_RING
+                rte_mempool_put(sr_para->eNodeMpool, enCaChe.ep->mbuf_data);
+                mbuf_put_cnt++;
+#endif
             }
             SPOOLER_RING_DEC(sr_para);
             cur_event_cnt++;
@@ -1750,6 +2187,10 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
             SPOOLER_RING_DEC(sr_para);
             cur_event_cnt++;
             cur_eventid[enCaChe.rid] = enCaChe.ee->event_id;
+#ifdef SPO_MPOOL_RING
+            rte_mempool_put(sr_para->eNodeMpool, enCaChe.ee->mbuf_data);
+            mbuf_put_cnt++;
+#endif
             break;
         }
         case OUTPUT_TYPE__SPECIAL: {
@@ -1797,12 +2238,25 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
 #endif
 
             cur_eventid[enCaChe.rid] = enCaChe.ee->event_id;
+#ifdef SPO_MPOOL_RING
+            rte_mempool_put(sr_para->eNodeMpool, enCaChe.ee->mbuf_data);
+            mbuf_put_cnt++;
+            sr_para->sring->mr_flag = 1;
+#ifndef SPO_MPOOL_DEBUG
+            if ( enCaChe.ep->mbuf_turn2base )
+#endif
+                rte_mempool_put(sr_para->eNodeMpool, enCaChe.ep->mbuf_data);
+#endif
             break;
         }
         default:
             LogMessage("%s: Unknown type, skipped\n", __func__);
             SPOOLER_RING_DEC(sr_para)
             cur_event_cnt++;
+#ifdef SPO_MPOOL_RING
+            rte_mempool_put(sr_para->eNodeMpool, enCaChe.ee->mbuf_data);
+            mbuf_put_cnt++;
+#endif
             break;
         }
 
@@ -1812,10 +2266,18 @@ void* spoolerRecordOutput_T(void * arg) //, int fire_output)
         SPOOLER_WALDO_SET_REC(sr_para->waldo, timestamp, record_idx);
     }
 
+#ifdef SPO_MPOOL_RING
+
+#else
     /*Flush out all record in database cache*/
     CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, NULL, UNIFIED2_IDS_FLUSH_OUT);
     CallOutputPlugins(OUTPUT_TYPE__FLUSH, NULL, NULL, UNIFIED2_IDS_SPO_EXIT);
+#endif
 
+#ifdef SPO_MPOOL_DEBUG_LOG
+    LogMessage("%s: mbuf_evn_cnt %lu, mbuf_put_cnt %lu\n", __func__,
+            mbuf_evn_cnt, mbuf_put_cnt);
+#endif
     LogMessage("%s:  -----> exiting\n", __func__);
 
     return NULL;
@@ -1829,6 +2291,7 @@ int spoolerEventRingGetcp(void)
     return 0;
 }
 
+#ifdef SPO_ANCIENT_PATH
 int spoolerEventCachePush(Spooler *spooler, uint32_t type, void *data,
         u_int32_t event_id, u_int32_t event_second)
 {
@@ -1934,6 +2397,7 @@ uint8_t spoolerEventCacheHeadUsed(Spooler *spooler)
     return 0;
 #endif
 }
+#endif
 #ifndef SPOOLER_RECORD_RING
 int spoolerEventCacheClean(Spooler *spooler)
 {
@@ -2024,7 +2488,7 @@ void spoolerEventCacheFlush(Spooler *spooler)
     EventRecordNode *evt_ptr = NULL;
 #endif
 
-    if (spooler == NULL || spooler->spara->sring->event_cache == NULL)
+    if (spooler == NULL || spooler->spara->sring == NULL)
         return;
 
 #ifndef SPOOLER_RING_SIZE

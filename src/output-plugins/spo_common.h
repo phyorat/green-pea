@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 void syslog_timestamp(uint32_t, uint32_t, char *);
+void SPO_PrintUsage(void);
 
 #endif /* __SPO_COMMON_H__ */
 

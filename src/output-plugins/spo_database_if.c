@@ -2,6 +2,24 @@
 #include "spo_database_if.h"
 
 
+/* Database Reliability */
+
+/* Ensure that we do not get some wierd poker's */
+u_int32_t checkDatabaseType(DatabaseData *data) {
+    if (data == NULL) {
+        /* XXX */
+        return 1;
+    }
+
+    if (data->dbtype_id <= DB_ENUM_MIN_VAL
+            || data->dbtype_id > DB_ENUM_MAX_VAL) {
+        /* XXX */
+        return 1;
+    }
+
+    return 0;
+}
+
 /*******************************************************************************
  * Function: Connect(DatabaseData * data)
  *
@@ -435,59 +453,6 @@ void Disconnect(DatabaseData * data, uint8_t q_sock)
     }
 
     return;
-}
-
-void DatabasePrintUsage(void) {
-    puts("\nUSAGE: database plugin\n");
-
-    puts(
-            " output database: [log | alert], [type of database], [parameter list]\n");
-    puts(" [log | alert] selects whether the plugin will use the alert or");
-    puts(" log facility.\n");
-
-    puts(" For the first argument, you must supply the type of database.");
-    puts(" The possible values are mysql, postgresql, odbc, oracle and");
-    puts(" mssql ");
-
-    puts(" The parameter list consists of key value pairs. The proper");
-    puts(" format is a list of key=value pairs each separated a space.\n");
-
-    puts(" The only parameter that is absolutely necessary is \"dbname\".");
-    puts(" All other parameters are optional but may be necessary");
-    puts(" depending on how you have configured your RDBMS.\n");
-
-    puts(" dbname - the name of the database you are connecting to\n");
-
-    puts(" host - the host the RDBMS is on\n");
-
-    puts(" port - the port number the RDBMS is listening on\n");
-
-    puts(" user - connect to the database as this user\n");
-
-    puts(" password - the password for given user\n");
-
-    puts(
-            " sensor_name - specify your own name for this barnyard2 sensor. If you");
-    puts("        do not specify a name one will be generated automatically\n");
-
-    puts(" encoding - specify a data encoding type (hex, base64, or ascii)\n");
-
-    puts(" detail - specify a detail level (full or fast)\n");
-
-    puts(
-            " ignore_bpf - specify if you want to ignore the BPF part for a sensor\n");
-    puts("              definition (yes or no, no is default)\n");
-
-    puts(" FOR EXAMPLE:");
-    puts(" The configuration I am currently using is MySQL with the database");
-    puts(
-            " name of \"snort\". The user \"snortusr@localhost\" has INSERT and SELECT");
-    puts(
-            " privileges on the \"snort\" database and does not require a password.");
-    puts(" The following line enables barnyard2 to log to this database.\n");
-
-    puts(
-            " output database: log, mysql, dbname=snort user=snortusr host=localhost\n");
 }
 
 /*******************************************************************************
@@ -2008,6 +1973,403 @@ void ODBCPrintError(DatabaseData *data,SQLSMALLINT iHandleType)
     return;
 }
 #endif /* ENABLE_ODBC */
+
+/*******************************************************************************
+ * Function: BeginTransaction(DatabaseData * data)
+ *
+ * Purpose: Database independent SQL to start a transaction
+ *
+ ******************************************************************************/
+u_int32_t BeginTransaction(DatabaseData * data, uint8_t q_sock)
+{
+    if (data == NULL) {
+        FatalError("database [%s()], Invoked with NULL DatabaseData \n",
+                __FUNCTION__);
+    }
+
+    if (checkTransactionState(&data->m_dbins[q_sock])) {
+        /* We already are in a transaction, possible nested call do not sub BEGIN..*/
+        return 0;
+    }
+
+    switch (data->dbtype_id) {
+#ifdef ENABLE_ODBC
+    case DB_ODBC:
+    setTransactionState(&data->dbRH[data->dbtype_id]);
+    return 0;
+    break;
+#endif
+
+#ifdef ENABLE_MSSQL
+    case DB_MSSQL:
+    setTransactionState(&data->dbRH[data->dbtype_id]);
+    if( Insert("BEGIN TRANSACTION", data,0)) {
+        /*XXX */
+        return 1;
+    }
+    return 0;
+    break;
+#endif
+
+#ifdef ENABLE_ORACLE
+    case DB_ORACLE:
+    /* Do nothing.  Oracle will implicitly create a transaction. */
+    /* CHECK -elz i will have to check on that */
+    return 0;
+    break;
+#endif
+
+    default:
+        setTransactionState(&data->m_dbins[q_sock]);
+        if (Insert("BEGIN;", data, 0, q_sock)) {
+            return 1;
+        }
+        return 0;
+        break;
+    }
+
+    return 1;
+}
+
+/*******************************************************************************
+ * Function: CommitTransaction(DatabaseData * data)
+ *
+ * Purpose: Database independent SQL to commit a transaction
+ *
+ ******************************************************************************/
+u_int32_t CommitTransaction(DatabaseData * data, uint8_t q_sock) {
+
+    if (data == NULL) {
+        /* XXX */
+        FatalError("database [%s()], Invoked with NULL DatabaseData \n",
+                __FUNCTION__);
+    }
+
+    if ((checkTransactionState(&data->m_dbins[q_sock])) == 0) {
+        LogMessage(" We are not in a transaction, effect of some possible nested call be quiet ");
+        return 0;
+    }
+
+    switch (data->dbtype_id) {
+#ifdef ENABLE_ODBC
+    case DB_ODBC:
+
+    //if( SQLEndTran(SQL_HANDLE_DBC, data->u_connection, SQL_COMMIT) != SQL_SUCCESS )
+    //{
+    //ODBCPrintError(data,SQL_HANDLE_DBC);
+    //}
+    goto transaction_success;
+    break;
+
+#endif
+#ifdef ENABLE_MSSQL
+
+    case DB_MSSQL:
+
+    if( Insert("COMMIT TRANSACTION", data,1))
+    {
+        /* XXX */
+        return 1;
+    }
+
+    goto transaction_success;
+    break;
+#endif
+#ifdef ENABLE_ORACLE
+    case DB_ORACLE:
+
+    return Insert("COMMIT WORK", data,1);
+    break;
+#endif
+
+    default:
+
+        if (Insert("COMMIT;", data, 1, q_sock)) {
+            /*XXX */
+            return 1;
+        }
+
+        goto transaction_success;
+
+        break;
+    }
+
+    /* XXX */
+    return 1;
+
+transaction_success:
+    /* Reset the transaction error count */
+    resetTransactionState(&data->m_dbins[q_sock]);
+    return 0;
+
+}
+
+/*******************************************************************************
+ * Function: RollbackTransaction(DatabaseData * data)
+ *
+ * Purpose: Database independent SQL to rollback a transaction
+ *
+ ******************************************************************************/
+u_int32_t RollbackTransaction(DatabaseData * data, uint8_t q_sock)
+{
+    if (data == NULL) {
+        FatalError("database [%s()], Invoked with NULL DatabaseData \n",
+                __FUNCTION__);
+    }
+
+    if (data->m_dbins[q_sock].transactionErrorCount
+            > data->dbRH[data->dbtype_id].transactionErrorThreshold) {
+        LogMessage(
+                "[%s(): Call failed, we reached the maximum number of transaction error [%u] \n",
+                __FUNCTION__,
+                data->dbRH[data->dbtype_id].transactionErrorThreshold);
+        return 1;
+    }
+
+    if ((data->dbRH[data->dbtype_id].dbConnectionStatus(
+            &data->dbRH[data->dbtype_id], q_sock))) {
+        LogMessage("[%s()] Call failed check to dbConnectionStatus()\n",
+                __FUNCTION__);
+        return 1;
+    }
+
+    if ((checkTransactionState(&data->m_dbins[q_sock])) == 0) {
+        /* We reached a rollback when not in transaction state announce it */
+        LogMessage("[%s()] : called while not in transaction \n", __FUNCTION__);
+        return 1;
+    }
+
+    if (getReconnectState(&data->m_dbins[q_sock])) {
+        /* Since We could get called from different places we are gown up and reset out self. */
+        resetTransactionState(&data->m_dbins[q_sock]);
+        /* We reconnected, transaction call failed , we can't call "ROLLBACK" since the transaction should have aborted  */
+        /* We reset state */
+        setReconnectState(&data->m_dbins[q_sock], 0);
+        return 0;
+    }
+
+    switch (data->dbtype_id) {
+#ifdef ENABLE_ODBC
+    case DB_ODBC:
+//      if( SQLEndTran(SQL_HANDLE_DBC, data->u_connection, SQL_ROLLBACK) != SQL_SUCCESS ) {
+//          ODBCPrintError(data,SQL_HANDLE_DBC);
+//          return 1;
+//      }
+    return 0;
+    break;
+#endif
+
+#ifdef ENABLE_MSSQL
+    case DB_MSSQL:
+    return Insert("ROLLBACK TRANSACTION;", data,0);
+    break;
+#endif
+
+#ifdef ENABLE_ORACLE
+    case DB_ORACLE:
+    return Insert("ROLLBACK WORK;", data,0);
+    break;
+#endif
+    default:
+        return Insert("ROLLBACK;", data, 0, q_sock);
+    }
+
+    /* XXX */
+    return 1;
+}
+
+/*******************************************************************************
+ * Function: UpdateLastCid(DatabaseData * data, uint8_t if_trans, uint8_t if_p)
+ *
+ * Purpose: Sets the last cid/mcid used for a given a sensor ID (sid),
+ *
+ * Arguments: data  : database information
+ *            if_trans   : if set transaction
+ *            if_p   : if print track log
+ *
+ * Returns: status of the update
+ *
+ ******************************************************************************/
+int UpdateLastCid(DatabaseData *data, uint8_t if_trans, uint8_t if_p, uint8_t q_sock)
+{
+    int i;
+
+    if ( if_trans ) {
+        if (BeginTransaction(data, q_sock)) {
+            FatalError(
+                    "database [%s()]: Failed to Initialize transaction, bailing ... \n",
+                    __FUNCTION__);
+        }
+    }
+
+    for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
+        DatabaseCleanInsert(data, q_sock);
+        if ((SnortSnprintf(data->SQL_INSERT[q_sock], MAX_QUERY_LENGTH, "UPDATE sensor "
+                "SET last_cid = %lu, last_mcid = %lu "
+                "WHERE sid = %u AND bid = %u;", data->cid[i], data->ms_cid[i], data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
+            return 1;
+        }
+
+        if (Insert(data->SQL_INSERT[q_sock], data, 1, q_sock)) {
+            return 1;
+        }
+
+        if (if_p)
+            LogMessage("%s: insert sid %d, bid %d, cid %lu, mcid %lu\n", __func__,
+                    data->sid, i, data->cid[i], data->ms_cid[i]);
+        else
+            DEBUG_U_WRAP_DEEP(LogMessage("%s: insert sid %d, bid %d, cid %lu, mcid %lu\n", __func__,
+                    data->sid, i, data->cid[i], data->ms_cid[i]));
+    }
+
+    if ( if_trans ) {
+        if (CommitTransaction(data, q_sock)) {
+            ErrorMessage("ERROR database: [%s()]: Error commiting transaction \n",
+                    __FUNCTION__);
+
+            setTransactionCallFail(&data->m_dbins[q_sock]);
+            return 1;
+        } else {
+            resetTransactionState(&data->m_dbins[q_sock]);
+        }
+    }
+
+    return 0;
+}
+
+/*******************************************************************************
+ * Function: GetLastCid(DatabaseData * data, int sid)
+ *
+ * Purpose: Returns the last cid used for a given a sensor ID (sid),
+ *
+ * Arguments: data  : database information
+ *            sid   : sensor ID
+ *
+ * Returns: last cid for a given sensor ID (sid)
+ *
+ ******************************************************************************/
+int GetLastCid(DatabaseData *data)
+{
+    int i;
+
+    for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
+        DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+
+        data->cid[i] = 0;
+        data->ms_cid[i] = 0;
+
+#ifdef USI_CID_UINT_64
+        if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH, "SELECT last_cid "
+                "  FROM sensor "
+                " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
+            continue;
+        }
+        if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*)&(data->cid[i]), SPO_DB_DEF_INS)) {
+            ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
+                    data->SQL_SELECT[SPO_DB_DEF_INS]);
+            continue;
+        }
+
+        //mcid
+        if ((SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], MAX_QUERY_LENGTH, "SELECT last_mcid "
+                "  FROM sensor "
+                " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
+            continue;
+        }
+        if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*)&(data->ms_cid[i]), SPO_DB_DEF_INS)) {
+            ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
+                    data->SQL_SELECT[SPO_DB_DEF_INS]);
+            continue;
+        }
+#else
+        if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH, "SELECT last_cid "
+                "  FROM sensor "
+                " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
+            continue;
+        }
+        if (Select(data->SQL_SELECT, data, (u_int32_t *)&(data->cid[i]))) {
+            ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
+                    data->SQL_SELECT);
+            continue;
+        }
+
+        //mcid
+        if ((SnortSnprintf(data->SQL_SELECT, MAX_QUERY_LENGTH, "SELECT last_mcid "
+                "  FROM sensor "
+                " WHERE sid = %u AND bid = %u;", data->sid, i)) != SNORT_SNPRINTF_SUCCESS) {
+            continue;
+        }
+        if (Select(data->SQL_SELECT, data, (u_int32_t *)&(data->ms_cid[i]))) {
+            ErrorMessage("ERROR database: executing Select() with Query [%s] \n",
+                    data->SQL_SELECT);
+            continue;
+        }
+#endif
+
+        LogMessage("%s: Get sid %d, bid %d, cid %lu, mcid %lu, \n", __func__, data->sid, i, data->cid[i], data->ms_cid[i]);
+    }
+
+    return 0;
+}
+
+int GetLastCidFromTable(DatabaseData *data)
+{
+    int i;
+    u_int32_t num_tables;
+    u_int32_t itr = 0;
+    us_cid_t c_cid = 0;
+    /*char *table_array[7] = { "data", "event",
+            "icmphdr", "iphdr", "opt", "tcphdr", "udphdr" };*/
+    char *table_array[1] = { "event" };
+
+    num_tables = sizeof(table_array)/sizeof(char*);
+    for (i=0; i<BY_MUL_TR_DEFAULT; i++) {
+        for (itr = 0; itr < num_tables; itr++) {
+            c_cid = 0;
+            DatabaseCleanSelect(data, SPO_DB_DEF_INS);
+
+#ifdef USI_CID_UINT_64
+            if (SnortSnprintf(data->SQL_SELECT[SPO_DB_DEF_INS], data->SQL_SELECT_SIZE,
+                    "SELECT MAX(cid) FROM %s WHERE sid='%u' AND bid='%u';", table_array[itr],
+                    data->sid, i)) {
+                LogMessage("database: [%s()], was unable to build query \n",
+                        __FUNCTION__);
+                return 1;
+            }
+            if (Select_bigint(data->SQL_SELECT[SPO_DB_DEF_INS], data, (us_cid_t*) &c_cid, SPO_DB_DEF_INS)) {
+                DEBUG_WRAP(DebugMessage(DB_DEBUG,"database: [%s()]: Problems executing [%s], (there is probably no row in the table for sensor id [%d] \n",
+                                __FUNCTION__,
+                                data->SQL_SELECT,
+                                data->sid););
+            }
+#else
+            if (SnortSnprintf(data->SQL_SELECT, data->SQL_SELECT_SIZE,
+                    "SELECT MAX(cid) FROM %s WHERE sid='%u' AND bid='%u';", table_array[itr],
+                    data->sid, i)) {
+                LogMessage("database: [%s()], was unable to build query \n",
+                        __FUNCTION__);
+                return 1;
+            }
+            if (Select(data->SQL_SELECT, data, (u_int32_t *) &c_cid)) {
+                DEBUG_WRAP(DebugMessage(DB_DEBUG,"database: [%s()]: Problems executing [%s], (there is probably no row in the table for sensor id [%d] \n",
+                                __FUNCTION__,
+                                data->SQL_SELECT,
+                                data->sid););
+            }
+#endif
+
+            if (c_cid > data->cid[i]) {
+                LogMessage("%s, INFO database: Table [%s][%d] had a more recent cid [%lu] instead of [%lu] \n",
+                        __func__, table_array[itr], i, c_cid, data->cid[i]);
+                data->cid[i] = c_cid;
+            }
+        }
+        //data->ms_cid[i] = data->cid[i];
+        //data->cid[i]++;
+    }
+
+    return 0;
+}
 
 /* Database Reliability */
 

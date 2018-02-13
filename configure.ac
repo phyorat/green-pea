@@ -543,6 +543,32 @@ AC_ARG_WITH(mysql_libraries,
 	[  --with-mysql-libraries=DIR     MySQL library directory],
 	[with_mysql_libraries="$withval"; with_mysql="yes"],[with_mysql_libraries="no"])
 
+AC_ARG_WITH(esdb, 
+    [  --with-esdb=DIR               Support for ElasticSearch],
+    [ with_esdb="$withval"],
+    [ with_esdb="no" ])
+
+AC_ARG_WITH(esdb_includes,
+	[  --with-esdb-includes=DIR      ElasticSearch include directory],
+	[with_esdb_includes="$withval"; with_esdb="yes"],[with_esdb_includes="no"])
+
+AC_ARG_WITH(esdb_libraries,
+	[  --with-esdb-libraries=DIR     ElasticSearch library directory],
+	[with_esdb_libraries="$withval"; with_esdb="yes"],[with_esdb_libraries="no"])
+
+AC_ARG_WITH(dpdk,
+    [  --with-dpdk=DIR               Support for ElasticSearch],
+    [ with_dpdk="$withval"],
+    [ with_dpdk="no" ])
+
+AC_ARG_WITH(dpdk_includes,
+        [  --with-dpdk-includes=DIR      ElasticSearch include directory],
+        [with_dpdk_includes="$withval"; with_dpdk="yes"],[with_dpdk_includes="no"])
+
+AC_ARG_WITH(dpdk_libraries,
+        [  --with-dpdk-libraries=DIR     ElasticSearch library directory],
+        [with_dpdk_libraries="$withval"; with_dpdk="yes"],[with_dpdk_libraries="no"])
+
 default_directory="/usr /usr/local"
 if test "x$with_mysql" != "xno"; then
   if test "x$with_mysql" = "xyes"; then
@@ -725,6 +751,89 @@ if test "x$with_mysql" != "xno"; then
       fi
   fi
 fi
+
+if test "x$with_esdb" != "xno"; then
+  if test "x$with_esdb" = "xyes"; then
+    if test "x$with_esdb_includes" != "xno"; then
+        esdb_inc_directory="$with_esdb_includes";
+    else
+        esdb_inc_directory="$default_directory";
+    fi
+    if test "x$with_esdb_libraries" != "xno"; then
+        esdb_lib_directory="$with_esdb_libraries";
+    else
+        esdb_lib_directory="$default_directory";
+    fi
+  fi
+  for i in $esdb_inc_directory; do
+      if test -r "$i/es_action.h"; then
+        ESDB_INC_DIR="$i"
+      elif test -r "$i/include/es_action.h"; then
+        ESDB_INC_DIR="$i/include"
+      fi
+  done
+
+  for i in $esdb_lib_directory; do
+      if test -z "$ESDB_LIB_DIR"; then
+        str="$i/libesc.*"
+        for j in `echo $str`; do
+          if test -r $j; then
+            ESDB_LIB_DIR=$i
+            break 2
+          fi
+        done
+      fi
+  done           
+
+  if test -d "$ESDB_INC_DIR"; then
+    if test -d "$ESDB_LIB_DIR"; then
+      LDFLAGS="${LDFLAGS} -L${ESDB_LIB_DIR}"
+      CPPFLAGS="${CPPFLAGS} -I${ESDB_INC_DIR} -DENABLE_ESDB"
+      LIBS="-lesc -ljson-c -lcurl -lpthread -lheartbeat ${LIBS}"
+    fi
+  fi
+fi
+
+if test "x$with_dpdk" != "xno"; then
+  if test "x$with_dpdk" = "xyes"; then
+    if test "x$with_dpdk_includes" != "xno"; then
+        dpdk_inc_directory="$with_dpdk_includes";
+    else
+        dpdk_inc_directory="$default_directory";
+    fi
+    if test "x$with_dpdk_libraries" != "xno"; then
+        dpdk_lib_directory="$with_dpdk_libraries";
+    else
+        dpdk_lib_directory="$default_directory";
+    fi
+  fi
+  for i in $dpdk_inc_directory; do
+      if test -r "$i/rte_eal.h"; then
+        DPDK_INC_DIR="$i"
+      fi
+  done
+
+  for i in $dpdk_lib_directory; do
+      if test -z "$DPDK_LIB_DIR"; then
+        str="$i/libdpdk.*"
+        for j in `echo $str`; do
+          if test -r $j; then
+            DPDK_LIB_DIR=$i
+            break 2
+          fi
+        done
+      fi
+  done
+
+  if test -d "$DPDK_INC_DIR"; then
+    if test -d "$DPDK_LIB_DIR"; then
+      LDFLAGS="${LDFLAGS} -L${DPDK_LIB_DIR}"
+      CPPFLAGS="${CPPFLAGS} -I${DPDK_INC_DIR} -DENABLE_DPDK -msse4"
+      LIBS="-Wl,--whole-archive,-ldpdk,--no-whole-archive ${LIBS} -ldl -lm"
+    fi
+  fi
+fi
+
 
 AC_ARG_ENABLE(mysql-ssl-support,
 [  --enable-mysql-ssl-support           Enable support for mysql SSL connections (experimental)],

@@ -75,6 +75,7 @@
 #include "output-plugins/spo_echidna.h"
 #include "output-plugins/spo_sguil.h"
 #include "output-plugins/spo_syslog_full.h"
+#include "output-plugins/spo_mpool_ring.h"
 
 extern InputConfigFuncNode  *input_config_funcs;
 extern OutputConfigFuncNode *output_config_funcs;
@@ -333,7 +334,11 @@ void RegisterOutputPlugins(void)
     LogTcpdumpSetup();
 #endif /* HAVE_LIBPCAP */
 
+#ifdef SPO_MPOOL_RING
+    spo_mr_setup();
+#else
     DatabaseSetup();
+#endif
     AlertFastSetup();
     AlertFullSetup();
     AlertFWsamSetup();

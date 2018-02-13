@@ -388,6 +388,7 @@ typedef struct _Barnyard2Config
 
     /* Multi thread support */
     uint32_t trbit_valid;
+    uint64_t mr_lcore;      //MPOOL-RING Core ID
     uint64_t tr_lcore[BY_MUL_TR_DEFAULT];    //Support Maximum 64 cores
     Waldo waldos[BY_MUL_TR_DEFAULT];
     uint8_t waldo_state;

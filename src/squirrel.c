@@ -157,7 +157,7 @@ static char **barnyard2_argv = NULL;
 #ifndef WIN32
 /* Unix does not support an argument to -s <wink marty!> OR -E, -W */
 static char *valid_options =
-        "?a:Ac:C:d:Def:Fg:G:h:i:Il:m:Mef:noOqr:R:S:t:Tu:UvVw:xXy";
+        "?a:Ac:b:C:d:Def:Fg:G:h:i:Il:m:Mef:noOqr:R:S:t:Tu:UvVw:xXy";
 #else
 /* Win32 does not support:  -D, -g, -m, -t, -u */
 /* Win32 no longer supports an argument to -s, either! */
@@ -735,6 +735,11 @@ static void ParseCmdLine(int argc, char **argv)
 
         case 'B': /* obfuscate with a substitution mask */
             ConfigObfuscationMask(bc, optarg);
+            break;
+
+        case 'b':
+            bc->mr_lcore = strtoul(optarg, NULL, 16);
+            LogMessage("%s: got mpool-ring lcore %lx\n", __func__, bc->mr_lcore);
             break;
 
         case 'c': /* use configuration file x */
@@ -1700,6 +1705,9 @@ static Barnyard2Config * MergeBarnyard2Confs(Barnyard2Config *cmd_line,
         config_file->ssHead = cmd_line->ssHead;
         cmd_line->ssHead = NULL;
     }
+
+    //mpool-ring-lcore
+    config_file->mr_lcore = cmd_line->mr_lcore;
 
     if ((cmd_line->sid_msg_file) && (config_file->sid_msg_file)) {
         FatalError(

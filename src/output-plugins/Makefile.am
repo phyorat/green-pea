@@ -22,9 +22,11 @@ spo_log_tcpdump.c spo_log_tcpdump.h \
 spo_sguil.c spo_sguil.h \
 spo_echidna.c spo_echidna.h \
 spo_syslog_full.c spo_syslog_full.h \
-spo_database_if.c spo_database_if.h \
-spo_database.c spo_database.h \
-spo_database_cache.c spo_database_cache.h \
-spo_database_fm.c spo_database_fm.h
+spo_database_cache.c spo_database_cache.h
+
+libspo_a_SOURCES_my=spo_database.c spo_database.h spo_database_if.c spo_database_if.h spo_database_fm.c spo_database_fm.h
+libspo_a_SOURCES_es=spo_database_es.c spo_database_es.h
+libspo_a_SOURCES_mr=spo_mpool_ring.c spo_mpool_ring.h
+libspo_a_SOURCES+=$(libspo_a_SOURCES_es) $(libspo_a_SOURCES_mr)
 
 AM_CPPFLAGS = -I.. -I ../sfutil

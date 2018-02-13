@@ -406,11 +406,6 @@ typedef struct _SQLQueryList {
                                     }
 
 
-
-#ifndef ENABLE_MYSQL
-  #define ENABLE_MYSQL
-#endif
-
 #define     SPO_DB_DEF_INS        0     //Default Instance
 
 //#define DEBUG_USI_SPOOLER_QUERY
@@ -446,9 +441,9 @@ typedef struct __SQLEvent {
     uint8_t rid;
     us_cid_t event_id;
     uint32_t event_type;
+    u_int32_t i_sig_id;
     void *event;
     Packet *p;
-    u_int32_t i_sig_id;
 }SQLEvent;
 
 typedef struct __SQLEventQueue {
@@ -470,7 +465,9 @@ typedef struct _dbReliabilityHandle {
 
     struct timespec dbReconnectSleepTime; /* Sleep time (milisec) before attempting a reconnect */
 	u_int8_t disablesigref; /* Allow user to prevent generation and creation of signature reference table */
+#ifdef ENABLE_MYSQL
     my_bool mysql_reconnect; /* We will handle it via the api. */
+#endif
 
 	struct _DatabaseData *dbdata; /* Pointer to parent structure used for call clarity */
 
@@ -537,10 +534,12 @@ typedef struct __lquery_instance
 typedef struct _DatabaseIns
 {
     void *spo_data;
+#ifdef ENABLE_MYSQL
     MYSQL * m_sock;
     MYSQL_RES * m_result;
     MYSQL_ROW m_row;
 
+#endif
     u_int32_t dbConnectionCount; /* Count of effective reconnection */
     u_int32_t dbConnectionStat; /* Database Connection status (barnyard2) */
     u_int32_t dbReconnectedInTransaction;
@@ -573,7 +572,7 @@ typedef struct _DatabaseData
 	char *dbname;
 	char *host;
 	int sid;
-	int bid;
+//	int bid;
 	us_cid_t cid[BY_MUL_TR_DEFAULT];
 	us_cid_t ms_cid[BY_MUL_TR_DEFAULT];
 	int reference;
@@ -600,6 +599,12 @@ typedef struct _DatabaseData
 	lquery_instance lEleQue_ins[SQL_ELEQUE_INS_MAX];
 	MasterCache mc;
 
+#ifdef ENABLE_ES
+	uint64_t send_cnt;
+	struct rte_ring *spo_ring;
+//    struct rte_ring *spo_ring_ret;
+#endif
+
 #ifdef ENABLE_POSTGRESQL
 	PGconn * p_connection;
 	PGresult * p_result;
@@ -608,12 +613,10 @@ typedef struct _DatabaseData
 	char p_pingString[1024];
 #endif
 #endif
-#ifdef ENABLE_MYSQL
 /*	MYSQL * m_sock;
 	MYSQL_RES * m_result;
 	MYSQL_ROW m_row;*/
 	DatabaseIns m_dbins[SQL_QUERY_SOCK_MAX];
-#endif
 #ifdef ENABLE_ODBC
 	SQLHENV u_handle;
 	SQLHDBC u_connection;
@@ -750,40 +753,10 @@ void Spo_Database(Packet *, void *, uint32_t, void *);
 void SpoDatabaseCleanExitFunction(int, void *);
 void SpoDatabaseRestartFunction(int, void *);
 void InitDatabase();
-void DatabasePrintUsage();
 
-int Insert(char *, DatabaseData *, u_int32_t, uint8_t);
-int Insert_real(char * , uint32_t , DatabaseData *, u_int32_t, uint8_t);
-int Select(char *, DatabaseData *, u_int32_t *, uint8_t);
-int Select_bigint(char *, DatabaseData *, uint64_t *, uint8_t);
-int UpdateLastCid(DatabaseData *, uint8_t, uint8_t, uint8_t);
-int GetLastCid(DatabaseData *);
-int GetLastCidFromTable(DatabaseData *);
 int CheckDBVersion(DatabaseData *);
 
-u_int32_t BeginTransaction(DatabaseData *, uint8_t);
-u_int32_t CommitTransaction(DatabaseData *, uint8_t);
-u_int32_t RollbackTransaction(DatabaseData *, uint8_t);
-
 u_int32_t checkDatabaseType(DatabaseData *);
-u_int32_t checkTransactionState(DatabaseIns *);
-u_int32_t checkTransactionCall(DatabaseIns *);
-u_int32_t dbReconnectSetCounters(dbReliabilityHandle *, DatabaseIns *);
-u_int32_t MYSQL_ManualConnect(DatabaseData *, uint8_t);
-u_int32_t dbConnectionStatusMYSQL(dbReliabilityHandle *, uint8_t);
-
-void resetTransactionState(DatabaseIns *);
-void setTransactionState(DatabaseIns *);
-void setTransactionCallFail(DatabaseIns *);
-
-u_int32_t getReconnectState(DatabaseIns *);
-void setReconnectState(DatabaseIns *, u_int32_t);
-
-void DatabaseCleanSelect(DatabaseData *data, uint8_t q_sock);
-void DatabaseCleanInsert(DatabaseData *data, uint8_t q_sock);
-
-void Connect(DatabaseData *, uint8_t);
-void Disconnect(DatabaseData *, uint8_t);
 
 u_int32_t ConvertDefaultCache(Barnyard2Config *bc, DatabaseData *data);
 u_int32_t CacheSynchronize(DatabaseData *data);
@@ -804,4 +777,103 @@ u_int32_t dbConnectionStatusODBC(dbReliabilityHandle *pdbRH);
 #ifdef ENABLE_ODBC
 void ODBCPrintError(DatabaseData *data,SQLSMALLINT iSTMT_type);
 #endif
+
+
+//SPO_DATABASE_CACHE_H
+/* LOOKUP FUNCTIONS */
+cacheSignatureObj *cacheGetSignatureNodeUsingDBid(cacheSignatureObj *iHead,
+        u_int32_t lookupId);
+cacheReferenceObj *cacheGetReferenceNodeUsingDBid(cacheSystemObj *iHead,
+        u_int32_t lookupId);
+
+u_int32_t cacheSignatureLookup(dbSignatureObj *iLookup,
+        cacheSignatureObj *iHead);
+u_int32_t cacheClassificationLookup(dbClassificationObj *iLookup,
+        cacheClassificationObj *iHead);
+u_int32_t cacheSystemLookup(dbSystemObj *iLookup, cacheSystemObj *iHead,
+        cacheSystemObj **rcacheSystemObj);
+u_int32_t cacheReferenceLookup(dbReferenceObj *iLookup,
+        cacheReferenceObj *iHead, cacheReferenceObj **retRefLookupNode);
+
+u_int32_t dbSignatureReferenceLookup(dbSignatureReferenceObj *iLookup,
+        cacheSignatureReferenceObj *iHead,
+        cacheSignatureReferenceObj **retSigRef, u_int32_t refCondCheck);
+u_int32_t dbReferenceLookup(dbReferenceObj *iLookup, cacheReferenceObj *iHead);
+u_int32_t dbSystemLookup(dbSystemObj *iLookup, cacheSystemObj *iHead);
+u_int32_t dbSignatureLookup(dbSignatureObj *iLookup, cacheSignatureObj *iHead);
+u_int32_t dbClassificationLookup(dbClassificationObj *iLookup,
+        cacheClassificationObj *iHead);
+/* LOOKUP FUNCTIONS */
+
+/* CLASSIFICATION FUNCTIONS */
+u_int32_t ClassificationPullDataStore(DatabaseData *data,
+        dbClassificationObj **iArrayPtr, u_int32_t *array_length);
+u_int32_t ClassificationCacheUpdateDBid(dbClassificationObj *iDBList,
+        u_int32_t array_length, cacheClassificationObj **cacheHead);
+u_int32_t ClassificationPopulateDatabase(DatabaseData *data,
+        cacheClassificationObj *cacheHead);
+u_int32_t ClassificationCacheSynchronize(DatabaseData *data,
+        cacheClassificationObj **cacheHead);
+/* CLASSIFICATION FUNCTIONS */
+
+/* SIGNATURE FUNCTIONS */
+u_int32_t SignatureCacheUpdateDBid(DatabaseData *data, dbSignatureObj *iDBList,
+        u_int32_t array_length, cacheSignatureObj **cacheHead);
+u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
+        u_int32_t *array_length);
+u_int32_t SignatureCacheSynchronize(DatabaseData *data,
+        cacheSignatureObj **cacheHead);
+/* SIGNATURE FUNCTIONS */
+
+/* REFERENCE FUNCTIONS */
+u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
+        u_int32_t *array_length);
+u_int32_t ReferenceCacheUpdateDBid(dbReferenceObj *iDBList,
+        u_int32_t array_length, cacheSystemObj **cacheHead);
+u_int32_t ReferencePopulateDatabase(DatabaseData *data,
+        cacheReferenceObj *cacheHead);
+/* REFERENCE FUNCTIONS */
+
+/* SYSTEM FUNCTIONS */
+u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead);
+u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
+        u_int32_t *array_length);
+u_int32_t SystemCacheUpdateDBid(dbSystemObj *iDBList, u_int32_t array_length,
+        cacheSystemObj **cacheHead);
+u_int32_t SystemCacheSynchronize(DatabaseData *data, cacheSystemObj **cacheHead);
+/* SYSTEM FUNCTIONS */
+
+/* SIGNATURE REFERENCE FUNCTIONS */
+u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
+        dbSignatureReferenceObj **iArrayPtr, u_int32_t *array_length);
+u_int32_t SignatureReferenceCacheUpdateDBid(dbSignatureReferenceObj *iDBList,
+        u_int32_t array_length, cacheSignatureReferenceObj **cacheHead,
+        cacheSignatureObj *sigCacheHead, cacheSystemObj *systemCacheHead);
+
+u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
+        cacheSignatureReferenceObj *cacheHead);
+u_int32_t SigRefSynchronize(DatabaseData *data,
+        cacheSignatureReferenceObj **cacheHead, cacheSignatureObj *cacheSigHead);
+u_int32_t SignatureReferencePreGenerate(cacheSignatureObj *iHead);
+/* SIGNATURE REFERENCE FUNCTIONS */
+
+/* Init FUNCTIONS */
+u_int32_t ConvertDefaultCache(Barnyard2Config *bc, DatabaseData *data);
+u_int32_t GenerateSigRef(cacheSignatureReferenceObj **iHead,
+        cacheSignatureObj *sigHead);
+u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
+        cacheSignatureObj *cSobj, DatabaseData *data);
+u_int32_t ConvertClassificationCache(ClassType **iHead,
+        MasterCache *iMasterCache, DatabaseData *data);
+u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
+        DatabaseData *data);
+//u_int32_t CacheSynchronize(DatabaseData *data);
+/* Init FUNCTIONS */
+
+/* Destructor */
+void MasterCacheFlush(DatabaseData *data, u_int32_t flushFlag);
+/* Destructor */
+//SPO_DATABASE_CACHE_H END
+
+
 #endif  /* __SPO_DATABASE_H__ */

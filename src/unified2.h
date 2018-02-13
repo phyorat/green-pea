@@ -63,6 +63,8 @@ typedef enum __unified2_serve_type
     UNIFIED2_IDS_FLUSH_OUT = 2005,
     UNIFIED2_IDS_SPO_EXIT = 2006,
     UNIFIED2_IDS_GET_ELEQUE_INS = 2007,
+    UNIFIED2_IDS_SET_RINGS = 2008,      //For MPool-Ring
+    UNIFIED2_IDS_SET_CIDS = 2009,
 }unified2_serve_type;
 
 /* Each unified2 record will start out with one of these */

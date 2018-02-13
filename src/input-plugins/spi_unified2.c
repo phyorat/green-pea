@@ -46,6 +46,8 @@
 //#include <error.h>
 #include <pthread.h>
 
+#include <mn_mem_schedule.h>
+
 #include "squirrel.h"
 #include "debug.h"
 #include "plugbase.h"
@@ -272,10 +274,10 @@ inline int Unified2ReadFile(Spooler *spooler)
 	return BARNYARD2_SUCCESS;
 }
 
-inline int Unified2GetRecFromBuf(Spooler *spooler, uint8_t *buf, uint16_t r_len)
+inline int Unified2GetRecFromBuf(/*Spooler *spooler*/Record *pRecord, uint8_t *buf, uint16_t r_len)
 {
-	uint32_t *data_pos = &(spooler->record.data_pos);
-	uint32_t *data_end = &(spooler->record.data_end);
+	uint32_t *data_pos = &(pRecord->data_pos);
+	uint32_t *data_end = &(pRecord->data_end);
 
 	DEBUG_U_WRAP(LogMessage("%s: d_pos %d, d_end %d, e_cur %d\n", __func__,
 			spooler->record.data_pos, spooler->record.data_end, spooler->spara->sring->event_cur));
@@ -286,35 +288,34 @@ inline int Unified2GetRecFromBuf(Spooler *spooler, uint8_t *buf, uint16_t r_len)
 
 	if ( (*data_pos+r_len) <= *data_end ) {
 		DEBUG_U_WRAP(LogMessage("%s: read sufficient data, len %d\n", __func__, r_len));
-		memcpy(buf, &(spooler->record.data[*data_pos]), r_len);
+		memcpy(buf, &(pRecord->data[*data_pos]), r_len);
 		*data_pos += r_len;
 	}
 	else {
 		r_len = *data_end - *data_pos;
 		DEBUG_U_WRAP(LogMessage("%s: read insufficient data, len %d\n", __func__, r_len));
-		memcpy(buf, &(spooler->record.data[*data_pos]), r_len);
+		memcpy(buf, &(pRecord->data[*data_pos]), r_len);
 		*data_pos = *data_end;
 	}
 
 	return r_len;
 }
 
-uint16_t Unified2RetrieveRecordHeader(Spooler *spooler, uint16_t r_len)
+uint16_t Unified2RetrieveRecordHeader(Spooler *spooler, uint8_t *pbuf, uint16_t r_len)
 {
 	uint16_t ret_len;
-	uint8_t *pbuf;
 
 	DEBUG_U_WRAP(LogMessage("%s: event_cur %d, event_top %d\n", __func__,
 	        spooler->spara->sring->event_cur, spooler->spara->sring->event_top));
 
-	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].header;
-	ret_len = Unified2GetRecFromBuf(spooler, pbuf, r_len);
+	//pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].header;
+	ret_len = Unified2GetRecFromBuf(&spooler->record, pbuf, r_len);
 
 	if ( ret_len < r_len ) {
 		if ( BARNYARD2_SUCCESS == Unified2ReadFile(spooler) ) {
 			r_len -= ret_len;
 			pbuf += ret_len;
-			ret_len += Unified2GetRecFromBuf(spooler, pbuf, r_len);
+			ret_len += Unified2GetRecFromBuf(&spooler->record, pbuf, r_len);
 		}
 	}
 
@@ -327,13 +328,13 @@ uint16_t Unified2RetrieveRecord(Spooler *spooler, uint16_t r_len)
 	uint8_t *pbuf;
 
 	pbuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].data;
-	ret_len = Unified2GetRecFromBuf(spooler, pbuf, r_len);
+	ret_len = Unified2GetRecFromBuf(&spooler->record, pbuf, r_len);
 
 	if ( ret_len < r_len ) {
 		if ( BARNYARD2_SUCCESS == Unified2ReadFile(spooler) ) {
 			r_len -= ret_len;
 			pbuf += ret_len;
-			ret_len += Unified2GetRecFromBuf(spooler, pbuf, r_len);
+			ret_len += Unified2GetRecFromBuf(&spooler->record, pbuf, r_len);
 		}
 	}
 
@@ -345,6 +346,7 @@ uint16_t Unified2RetrieveRecord(Spooler *spooler, uint16_t r_len)
  */
 int Unified2ReadRecordHeader(void *sph)
 {
+    uint8_t *pHeadBuf;
     ssize_t             bytes_read;
     Spooler             *spooler = (Spooler *)sph;
 
@@ -394,7 +396,8 @@ int Unified2ReadRecordHeader(void *sph)
         LogMessage("ERROR: Read error: %s\n", strerror(errno));
         return BARNYARD2_FILE_ERROR;
     }*/
-    bytes_read = Unified2RetrieveRecordHeader(spooler, sizeof(Unified2RecordHeader));
+    pHeadBuf = spooler->spara->sring->event_cache[spooler->spara->sring->event_prod].header;
+    bytes_read = Unified2RetrieveRecordHeader(spooler, pHeadBuf, sizeof(Unified2RecordHeader));
     DEBUG_U_WRAP(LogMessage("%s: bytes_read %d, type %d, length %d\n", __func__, bytes_read,
     	    ntohl(((Unified2RecordHeader *)spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].header)->type),
     	    ntohl(((Unified2RecordHeader *)spooler->spara->sring->event_cache[spooler->spara->sring->event_cur].header)->length)));
@@ -480,6 +483,10 @@ int Unified2ReadRecord(void *sph)
             return BARNYARD2_FILE_ERROR;
         }*/
 
+#ifdef SPO_MPOOL_RING
+        if ( record_length > SP_MPOOL_BUF_LEN )
+            record_length = SP_MPOOL_BUF_LEN;
+#endif
         bytes_read = Unified2RetrieveRecord(spooler, record_length);
         DEBUG_U_WRAP(LogMessage("%s: bytes_read %d, record_type %d\n", __func__, bytes_read, record_type));
         if (bytes_read != record_length)

@@ -33,99 +33,6 @@
 #include "output-plugins/spo_database.h"
 #include "output-plugins/spo_database_cache.h"
 
-/* LOOKUP FUNCTIONS */
-cacheSignatureObj *cacheGetSignatureNodeUsingDBid(cacheSignatureObj *iHead,
-		u_int32_t lookupId);
-cacheReferenceObj *cacheGetReferenceNodeUsingDBid(cacheSystemObj *iHead,
-		u_int32_t lookupId);
-
-u_int32_t cacheSignatureLookup(dbSignatureObj *iLookup,
-		cacheSignatureObj *iHead);
-u_int32_t cacheClassificationLookup(dbClassificationObj *iLookup,
-		cacheClassificationObj *iHead);
-u_int32_t cacheSystemLookup(dbSystemObj *iLookup, cacheSystemObj *iHead,
-		cacheSystemObj **rcacheSystemObj);
-u_int32_t cacheReferenceLookup(dbReferenceObj *iLookup,
-		cacheReferenceObj *iHead, cacheReferenceObj **retRefLookupNode);
-
-u_int32_t dbSignatureReferenceLookup(dbSignatureReferenceObj *iLookup,
-		cacheSignatureReferenceObj *iHead,
-		cacheSignatureReferenceObj **retSigRef, u_int32_t refCondCheck);
-u_int32_t dbReferenceLookup(dbReferenceObj *iLookup, cacheReferenceObj *iHead);
-u_int32_t dbSystemLookup(dbSystemObj *iLookup, cacheSystemObj *iHead);
-u_int32_t dbSignatureLookup(dbSignatureObj *iLookup, cacheSignatureObj *iHead);
-u_int32_t dbClassificationLookup(dbClassificationObj *iLookup,
-		cacheClassificationObj *iHead);
-/* LOOKUP FUNCTIONS */
-
-/* CLASSIFICATION FUNCTIONS */
-u_int32_t ClassificationPullDataStore(DatabaseData *data,
-		dbClassificationObj **iArrayPtr, u_int32_t *array_length);
-u_int32_t ClassificationCacheUpdateDBid(dbClassificationObj *iDBList,
-		u_int32_t array_length, cacheClassificationObj **cacheHead);
-u_int32_t ClassificationPopulateDatabase(DatabaseData *data,
-		cacheClassificationObj *cacheHead);
-u_int32_t ClassificationCacheSynchronize(DatabaseData *data,
-		cacheClassificationObj **cacheHead);
-/* CLASSIFICATION FUNCTIONS */
-
-/* SIGNATURE FUNCTIONS */
-u_int32_t SignatureCacheUpdateDBid(DatabaseData *data, dbSignatureObj *iDBList,
-		u_int32_t array_length, cacheSignatureObj **cacheHead);
-u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
-		u_int32_t *array_length);
-u_int32_t SignatureCacheSynchronize(DatabaseData *data,
-		cacheSignatureObj **cacheHead);
-/* SIGNATURE FUNCTIONS */
-
-/* REFERENCE FUNCTIONS */
-u_int32_t ReferencePullDataStore(DatabaseData *data, dbReferenceObj **iArrayPtr,
-		u_int32_t *array_length);
-u_int32_t ReferenceCacheUpdateDBid(dbReferenceObj *iDBList,
-		u_int32_t array_length, cacheSystemObj **cacheHead);
-u_int32_t ReferencePopulateDatabase(DatabaseData *data,
-		cacheReferenceObj *cacheHead);
-/* REFERENCE FUNCTIONS */
-
-/* SYSTEM FUNCTIONS */
-u_int32_t SystemPopulateDatabase(DatabaseData *data, cacheSystemObj *cacheHead);
-u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
-		u_int32_t *array_length);
-u_int32_t SystemCacheUpdateDBid(dbSystemObj *iDBList, u_int32_t array_length,
-		cacheSystemObj **cacheHead);
-u_int32_t SystemCacheSynchronize(DatabaseData *data, cacheSystemObj **cacheHead);
-/* SYSTEM FUNCTIONS */
-
-/* SIGNATURE REFERENCE FUNCTIONS */
-u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
-		dbSignatureReferenceObj **iArrayPtr, u_int32_t *array_length);
-u_int32_t SignatureReferenceCacheUpdateDBid(dbSignatureReferenceObj *iDBList,
-		u_int32_t array_length, cacheSignatureReferenceObj **cacheHead,
-		cacheSignatureObj *sigCacheHead, cacheSystemObj *systemCacheHead);
-
-u_int32_t SignatureReferencePopulateDatabase(DatabaseData *data,
-		cacheSignatureReferenceObj *cacheHead);
-u_int32_t SigRefSynchronize(DatabaseData *data,
-		cacheSignatureReferenceObj **cacheHead, cacheSignatureObj *cacheSigHead);
-u_int32_t SignatureReferencePreGenerate(cacheSignatureObj *iHead);
-/* SIGNATURE REFERENCE FUNCTIONS */
-
-/* Init FUNCTIONS */
-u_int32_t ConvertDefaultCache(Barnyard2Config *bc, DatabaseData *data);
-u_int32_t GenerateSigRef(cacheSignatureReferenceObj **iHead,
-		cacheSignatureObj *sigHead);
-u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
-		cacheSignatureObj *cSobj, DatabaseData *data);
-u_int32_t ConvertClassificationCache(ClassType **iHead,
-		MasterCache *iMasterCache, DatabaseData *data);
-u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
-		DatabaseData *data);
-u_int32_t CacheSynchronize(DatabaseData *data);
-/* Init FUNCTIONS */
-
-/* Destructor */
-void MasterCacheFlush(DatabaseData *data, u_int32_t flushFlag);
-/* Destructor */
 
 /* Return largest string lenght */
 inline u_int32_t glsl(char *a, char *b) {
@@ -749,6 +656,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 					SYSTEM_NAME_LEN);
 			sys_LobjNode.ref_system_name[SYSTEM_NAME_LEN - 1] = '\0'; //safety
 
+#ifdef ENABLE_MYSQL
 			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_name, data->sanitize_buffer[0],
 					SYSTEM_NAME_LEN, data))) {
 				FatalError(
@@ -756,6 +664,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 								"[%s], Exiting. \n", __FUNCTION__,
 						sys_LobjNode.ref_system_name);
 			}
+#endif
 
 		}
 
@@ -764,6 +673,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 					SYSTEM_URL_LEN);
 			sys_LobjNode.ref_system_url[SYSTEM_URL_LEN - 1] = '\0'; //safety
 
+#ifdef ENABLE_MYSQL
 			if ((snort_escape_string_STATIC(sys_LobjNode.ref_system_url, data->sanitize_buffer[0],
 					SYSTEM_URL_LEN, data))) {
 				FatalError(
@@ -771,6 +681,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 								"[%s], Exiting. \n", __FUNCTION__,
 						sys_LobjNode.ref_system_url);
 			}
+#endif
 		}
 
 		sysRetCacheNode = NULL;
@@ -802,6 +713,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 			strncpy(ref_LobjNode.ref_tag, cNode->id, REF_TAG_LEN);
 			ref_LobjNode.ref_tag[REF_TAG_LEN - 1] = '\0'; //safety
 
+#ifdef ENABLE_MYSQL
 			if ((snort_escape_string_STATIC(ref_LobjNode.ref_tag, data->sanitize_buffer[0],
 			        REF_TAG_LEN, data))) {
 				FatalError(
@@ -809,6 +721,7 @@ u_int32_t ConvertReferenceCache(ReferenceNode *iHead, MasterCache *iMasterCache,
 								"[%s], Exiting. \n", __FUNCTION__,
 						ref_LobjNode.ref_tag);
 			}
+#endif
 
 			/* Lookup Reference node */
 			if ((cacheReferenceLookup(&ref_LobjNode,
@@ -950,6 +863,7 @@ u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
 			strncpy(lookupNode.message, cNode->msg, SIG_MSG_LEN);
 			lookupNode.message[SIG_MSG_LEN - 1] = '\0'; //safety
 
+#ifdef ENABLE_MYSQL
 			if ((snort_escape_string_STATIC(lookupNode.message, data->sanitize_buffer[0],
 			        SIG_MSG_LEN, data))) {
 				FatalError(
@@ -957,6 +871,7 @@ u_int32_t ConvertSignatureCache(SigNode **iHead, MasterCache *iMasterCache,
 								"[%s], Exiting. \n", __FUNCTION__,
 						lookupNode.message);
 			}
+#endif
 		} else {
 			snprintf(lookupNode.message, SIG_MSG_LEN, "Snort Alert [%u:%u:%u]",
 					lookupNode.gid, lookupNode.sid, lookupNode.rev);
@@ -1060,6 +975,7 @@ u_int32_t ConvertClassificationCache(ClassType **iHead,
 			strncpy(LobjNode.obj.sig_class_name, cNode->type, CLASS_NAME_LEN);
 			LobjNode.obj.sig_class_name[CLASS_NAME_LEN - 1] = '\0'; //safety.
 
+#ifdef ENABLE_MYSQL
 			if ((snort_escape_string_STATIC(LobjNode.obj.sig_class_name, data->sanitize_buffer[0],
 					CLASS_NAME_LEN, data))) {
 				FatalError(
@@ -1067,6 +983,7 @@ u_int32_t ConvertClassificationCache(ClassType **iHead,
 								"[%s], Exiting. \n", __FUNCTION__,
 						LobjNode.obj.sig_class_name);
 			}
+#endif
 
 		} else {
 			snprintf(LobjNode.obj.sig_class_name, CLASS_NAME_LEN,
@@ -1099,6 +1016,7 @@ u_int32_t ConvertClassificationCache(ClassType **iHead,
 	return 0;
 }
 
+#ifdef ENABLE_MYSQL
 /***********************************************************************************************CLASSIFICATION API*/
 
 /**
@@ -1577,6 +1495,7 @@ u_int32_t ClassificationPullDataStore(DatabaseData *data,
 	/* XXX */
 	return 1;
 }
+#endif
 
 /** 
  *  Merge internal Classification cache with database data, detect difference, tag known node for database update
@@ -1634,6 +1553,7 @@ u_int32_t ClassificationCacheUpdateDBid(dbClassificationObj *iDBList,
 	return 0;
 }
 
+#ifdef ENABLE_MYSQL
 /** 
  *  Populate the sig_class table with record that are not present in the database.
  * 
@@ -1801,9 +1721,11 @@ u_int32_t ClassificationCacheSynchronize(DatabaseData *data,
 	/* out list will behave now */
 	return 0;
 }
+#endif
 
 /***********************************************************************************************CLASSIFICATION API*/
 
+#ifdef ENABLE_MYSQL
 /***********************************************************************************************SIGNATURE API*/
 
 /** 
@@ -1982,7 +1904,9 @@ u_int32_t SignaturePopulateDatabase(DatabaseData *data,
 				goto TransactionFail;
 			}*/
 
+#ifdef ENABLE_MYSQL
 			db_sig_id = mysql_insert_id(data->m_dbins[q_sock].m_sock);
+#endif
 			LogMessage("%s: Last query auto_increament id %d\n", __func__, db_sig_id);
 
 			cacheHead->obj.db_id = db_sig_id;
@@ -2009,6 +1933,7 @@ TransactionFail:
 
 	return 1;
 }
+#endif
 
 /**
  *  Merge internal Signature cache with database data, detect difference, tag known node for database update
@@ -2067,6 +1992,7 @@ u_int32_t SignatureCacheUpdateDBid(DatabaseData *data, dbSignatureObj *iDBList,
 	return 0;
 }
 
+#ifdef ENABLE_MYSQL
 /**
  * Fetch Signature from database
  *
@@ -2640,6 +2566,7 @@ u_int32_t SignaturePullDataStore(DatabaseData *data, dbSignatureObj **iArrayPtr,
 
 	return 0;
 }
+#endif
 
 /**
  * Find signature with the same SID and GID and set Ref. If Ref is found,
@@ -2687,6 +2614,7 @@ u_int32_t SignatureReferencePreGenerate(cacheSignatureObj *iHead) {
 
 }
 
+#ifdef ENABLE_MYSQL
 /**
  * Wrapper function for signature cache synchronization
  *
@@ -3751,6 +3679,7 @@ u_int32_t SystemPullDataStore(DatabaseData *data, dbSystemObj **iArrayPtr,
 
 	return 0;
 }
+#endif
 
 /** 
  *  Merge internal System cache with database data, detect difference, tag known node for database update
@@ -3857,6 +3786,7 @@ u_int32_t ReferenceCacheUpdateDBid(dbReferenceObj *iDBList,
 	return 0;
 }
 
+#ifdef ENABLE_MYSQL
 /**
  *  Populate the reference table with record that are not present in the database.
  *
@@ -4175,6 +4105,8 @@ u_int32_t SystemCacheSynchronize(DatabaseData *data, cacheSystemObj **cacheHead)
 	return 1;
 
 }
+#endif
+
 /***********************************************************************************************SYSTEM API*/
 /*
  ** Those update system and reference
@@ -4242,6 +4174,7 @@ u_int32_t GenerateSigRef(cacheSignatureReferenceObj **iHead,
 	return 0;
 }
 
+#ifdef ENABLE_MYSQL
 /** 
  * Fetch SignatureReference from database
  * 
@@ -4711,6 +4644,7 @@ u_int32_t SignatureReferencePullDataStore(DatabaseData *data,
 
 	return 0;
 }
+#endif
 
 /**
  * get Signature node from cache where DBid match the lookup id.
@@ -4962,6 +4896,7 @@ u_int32_t SignatureReferenceCacheUpdateDBid(dbSignatureReferenceObj *iDBList,
 
 }
 
+#ifdef ENABLE_MYSQL
 /** 
  *  Populate the sig_reference table with record that are not present in the database.
  * 
@@ -5155,6 +5090,7 @@ u_int32_t SigRefSynchronize(DatabaseData *data,
 	//Ze done.
 	return 0;
 }
+#endif
 /***********************************************************************************************SIGREF API*/
 
 /** 
@@ -5298,6 +5234,7 @@ void MasterCacheFlush(DatabaseData *data, u_int32_t flushFlag) {
 
 }
 
+#ifdef ENABLE_MYSQL
 /** 
  * Synchronize caches (internal from files and cache from database
  * 
@@ -5406,4 +5343,5 @@ u_int32_t CacheSynchronize(DatabaseData *data) {
 
 	return 0;
 }
+#endif
 

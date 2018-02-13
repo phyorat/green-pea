@@ -23,12 +23,42 @@
 #ifndef __SPOOLER_H__
 #define __SPOOLER_H__
 
+#include <species.h>
+
+//#####USI Compile Set up######################
+#ifdef BS_GEN_SPO_DB_MYSQL
+#ifndef ENABLE_MYSQL
+#define ENABLE_MYSQL
+#endif
+#elif defined(BS_GEN_DB_ES)
+#define ENABLE_ES
+#endif
+
+#ifdef BS_GEN_SPO_MPOOL_RING
+
+#include <rte_config.h>
+#include <rte_eal.h>
+//#include <rte_cycles.h>
+#include <rte_mempool.h>
+#include <rte_ring.h>
+#include <rte_errno.h>
+
+
+#define SPO_MPOOL_RING
+//#define SPO_MPOOL_DEBUG
+//#define SPO_MPOOL_DEBUG_LOG
+
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include <sys/types.h>
 
+#ifdef SPO_MPOOL_RING
+#include "sp_mpool.h"
+#endif
 #include "plugbase.h"
 
 
@@ -78,11 +108,6 @@ typedef enum
 
 #define handle_error_en(en, msg) \
         do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
-
-//#####USI Set up######################
-#ifndef ENABLE_MYSQL
-  #define ENABLE_MYSQL
-#endif
 
 #define SPOOLER_FILE_STREAM
 #define SPOOLER_FIXED_BUF
@@ -182,7 +207,13 @@ typedef struct _EventRecordNode
     uint32_t                record_idx; // current record number
     time_t                  timestamp;
     uint8_t                 header[8];
+#ifdef SPO_MPOOL_RING
+    uint8_t                 mbuf_turn2base;
+    EventMBuf               *mbuf_data;
+    uint8_t                 *data;
+#else
     uint8_t                 data[2048];
+#endif
     Packet                  s_pkt[1];
 #endif
     us_cid_t                event_id;  /* extracted from event original */
@@ -206,6 +237,17 @@ typedef struct __EventGMCid
     us_cid_t ms_cid;
 }EventGMCid;
 
+#ifdef ENABLE_ES
+typedef struct __EventSpoRings
+{
+    struct rte_mempool *dp_mpool;
+    struct rte_ring *ring_snd;
+    struct rte_ring *ring_ret;
+    struct rte_ring *ring_master;
+    struct rte_ring *ring_msg;
+} EventSpoMR;
+#endif
+
 typedef enum
 {
 	RING_ON,
@@ -220,7 +262,11 @@ typedef struct __spooler_ring
     uint16_t                event_top;
     uint16_t                event_coms;
     uint16_t                event_cnt;
-    uint16_t                r_flag;
+    uint8_t                 r_flag;
+    uint8_t                 rlog_wp;//log for wait packet after event.
+#ifdef SPO_MPOOL_RING
+    uint16_t                mr_flag;
+#endif
     uint32_t                i_sleep_cnt;
     uint32_t                o_sleep_cnt;
     us_cid_t                base_eventid;
@@ -325,6 +371,11 @@ typedef struct __spooler_r_para
     spooler_ring            *sring;
     Waldo                   *waldo;
     pthread_t               *ptid_join;
+#ifdef SPO_MPOOL_RING
+    struct rte_mempool      *eNodeMpool;
+    struct rte_ring         *eNodeRing;
+    struct rte_ring         *eNodeRingRet;
+#endif
     spooler_watch           swatch;
 }spooler_r_para;
 
